@@ -400,15 +400,40 @@ static void v1000_process_rx(struct Virte1000Base *base)
     ULONG dd_seen_this_call = 0;
     for (int slot = 0; slot < V1000_RING_ENTRIES; slot++) {
         volatile UBYTE *rd = (volatile UBYTE *)base->rx_ring + slot * V1000_DESC_SIZE;
+
+        /* PPC 460EX PCI DMA is not snoopy on sam460ex — HW writes to
+         * descriptor + rx_buffer in RAM bypass the CPU L1 cache. Using
+         * `volatile` re-issues the load instruction but doesn't force
+         * a cache miss. Invalidate (no writeback) so our next read
+         * fetches HW's fresh value from RAM. CACRF_InvalidateD, not
+         * CACRF_ClearD — Clear does writeback-then-invalidate, which
+         * would push our previous-round `rd[12]=0` back to RAM ON TOP
+         * of HW's just-set DD=1, losing every frame. */
+        IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_InvalidateD);
+
         if (!(rd[12] & 0x01)) continue;    /* not done */
         dd_seen_this_call++;
 
         ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
         if (frame_len < 14 || frame_len > V1000_RX_BUFSIZE) {
             rd[12] = 0;
+            /* Flush our clear to RAM so HW starts this slot fresh
+             * next time it writes here — CACRF_ClearD is writeback+
+             * invalidate, safe here because HW hasn't touched the
+             * slot again yet (we hold it until we bump RDT below). */
+            IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
+            e1000_write32(mmio, E1000_REG_RDT, slot);
             continue;
         }
         UBYTE *rxbuf = (UBYTE *)base->rx_buffers + slot * V1000_RX_BUFSIZE;
+        /* Same story for the frame buffer: HW wrote frame bytes to
+         * RAM, our cache still holds stale bytes from init or a
+         * previous shorter frame. Bytes past the first cache line
+         * come back wrong without this — ping data corrupts at
+         * offset 8 (which lands past the first 32-byte cache line
+         * inside the ICMP payload region). */
+        IExec->CacheClearE(rxbuf, frame_len, CACRF_InvalidateD);
+
         ULONG payload_len = frame_len - 14;
 
         /* Find any opener with a queued CMD_READ. First-come, first-serve
@@ -448,8 +473,15 @@ static void v1000_process_rx(struct Virte1000Base *base)
             delivered_this_slot = ok;
         }
         if (delivered_this_slot) base->process_rx_delivered++;
-        /* Whether we delivered or not, free the slot for HW reuse. */
+        /* Whether we delivered or not, free the slot for HW reuse.
+         * MUST flush the write to RAM (CACRF_ClearD) before bumping
+         * RDT — otherwise HW can DMA a new frame + set DD=1 in RAM
+         * while our cached DD=0 sits dirty. Next iteration's
+         * InvalidateD would then discard the (unflushed) 0, but that
+         * only masks the issue; a well-timed HW write between our
+         * dirty-cache and the invalidate could still be seen twice. */
         rd[12] = 0;
+        IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
         /* Bump RDT to hand this slot back. */
         e1000_write32(mmio, E1000_REG_RDT, slot);
     }
