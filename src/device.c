@@ -240,6 +240,21 @@ static inline void v1000_wmb(void)
     __asm__ volatile ("sync" : : : "memory");
 }
 
+/* Find the opener matching this request's bm_cookie. NULL if none —
+ * unusual (Open would have added one), but Close-race-safe. Caller
+ * should hold opener_lock (unless within Init/Expunge). */
+static struct V1000Opener *v1000_find_opener(struct Virte1000Base *base,
+                                              APTR bm_cookie)
+{
+    struct V1000Opener *op;
+    for (op = (struct V1000Opener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ;
+         op = (struct V1000Opener *)op->node.mln_Succ) {
+        if (op->bm_cookie == bm_cookie) return op;
+    }
+    return NULL;
+}
+
 /* Resolve a CPU-virtual allocation to its PCI-bus physical address
  * via the OS4-blessed StartDMA + GetDMAList path (pa6t_eth pattern).
  * Returns 0 on failure. Caller should have kept the allocation in the
@@ -1255,16 +1270,59 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         }
         ioreq->ios2_WireError = 0x3000;
 
-        /* Copy caller's frame into the shared RX buffer pool at
-         * tx_next_slot. Then get its PCI-bus physical address via
-         * StartDMA — that's what goes into the descriptor. Using
-         * CPU virt (as we did before) meant QEMU's e1000 DMA'd from
-         * the wrong location, TDH advanced, but no packet actually
-         * shipped (TPT stayed 0). */
+        /* Two shapes:
+         *   COOKED — opener has copy_from_buff hook. ios2_Data is an
+         *            opaque cookie the caller understands; we build the
+         *            14-byte Ethernet header (dst | src=our MAC | type)
+         *            and pull payload via IUtility->CallHookPkt.
+         *   RAW    — no hook (or no matching opener). ios2_Data is a
+         *            fully-framed L2 packet; we memcpy it verbatim.
+         * The RAW path is what testtx / V1000_DBG_SEND uses; cooked is
+         * what Roadshow (or testtx_cooked) uses. */
         ULONG slot = devBase->tx_next_slot;
         UBYTE *dst = (UBYTE *)devBase->rx_buffers + (slot * V1000_RX_BUFSIZE);
-        UBYTE *src = (UBYTE *)ioreq->ios2_Data;
-        for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+
+        struct V1000Opener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+        BOOL cooked = (op != NULL) && (op->copy_from_buff != NULL) && (devBase->IUtility != NULL);
+
+        if (cooked) {
+            /* Build 14-byte Ethernet header */
+            for (int i = 0; i < 6; i++) dst[i]     = ioreq->ios2_DstAddr[i];  /* dst */
+            for (int i = 0; i < 6; i++) dst[6 + i] = devBase->mac[i];         /* src */
+            uint16 etype = (uint16)(ioreq->ios2_PacketType & 0xFFFF);
+            dst[12] = (UBYTE)(etype >> 8);
+            dst[13] = (UBYTE)(etype & 0xFF);
+
+            /* Pull payload via the caller's CopyFromBuff hook. Per
+             * SANA-II-NOTES §2 + pa6t_eth pattern, invocation goes
+             * through IUtility->CallHookPkt with a SANA2CopyHookMsg. */
+            struct SANA2CopyHookMsg msg;
+            msg.schm_Method  = S2_CopyFromBuff;
+            msg.schm_MsgSize = sizeof(msg);
+            msg.schm_To      = dst + 14;
+            msg.schm_From    = ioreq->ios2_Data;    /* opaque cookie */
+            msg.schm_Size    = len;
+            BOOL ok = (BOOL)(ULONG)devBase->IUtility->CallHookPkt(
+                (struct Hook *)op->copy_from_buff, ioreq, &msg);
+            if (!ok) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                break;
+            }
+            /* Frame length now includes the Ethernet header. */
+            len = 14 + len;
+            if (len < 60) len = 60;  /* padding will be zero — dst was 0-init? not
+                                       * guaranteed; TCTL.PSP takes care of it on wire */
+        } else {
+            /* RAW: caller supplied full L2 frame in ios2_Data. */
+            UBYTE *src = (UBYTE *)ioreq->ios2_Data;
+            for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+        }
 
         /* Physical addr of this slot's buffer. We could use the cached
          * rx_buffers_phys + offset, but StartDMA at TX time also flushes
