@@ -114,7 +114,8 @@ int main(int argc, char **argv)
         0,0,0,0,0,0,   192, 168, 100, 11,
         0,0,0,0,0,0,   192, 168, 100, 2,
     };
-    for (int i = 0; i < 6; i++) payload[6 + i] = my_mac[i];
+    /* sha at ARP-body offset 8 (not 6 — 6 is the OPER field). */
+    for (int i = 0; i < 6; i++) payload[8 + i] = my_mac[i];
 
     req->ios2_BufferManagement = (APTR)bm_tags;
     req->ios2_Req.io_Command = CMD_WRITE;

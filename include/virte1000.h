@@ -128,6 +128,15 @@ struct Virte1000Base
     volatile BOOL       task_ready_ok;      /* task sets on successful start */
     struct Task        *parent_task;        /* startup handshake target */
     ULONG               parent_ready_mask;
+
+    /* Phase 6l diagnostic counters — exposed via DBG_STATUS so tests
+     * can pinpoint where the RX-to-CopyToBuff pipeline breaks:
+     *   task_wake_count       — # of times task woke on ISR signal
+     *   process_rx_dd_seen    — # of DD-set slots the last process_rx call saw
+     *   process_rx_delivered  — # of frames CopyToBuff'd to date */
+    volatile ULONG      task_wake_count;
+    volatile ULONG      process_rx_dd_seen;
+    volatile ULONG      process_rx_delivered;
 };
 
 /* Per-opener state — one entry per OpenDevice() call. Stashes the
@@ -174,5 +183,10 @@ struct V1000Opener
                                      * frame_len in ios2_DataLength on
                                      * success; io_Error = IOERR_UNITBUSY
                                      * if no frame ready. */
+#define V1000_DBG_DUMPTX   0xF005   /* Copy first 16 bytes of tx_scratch
+                                     * (last-built TX frame — Ethernet
+                                     * header + 2 payload bytes) into
+                                     * ios2_SrcAddr[0..15]. Diagnostic
+                                     * for cooked-mode framing bugs. */
 
 #endif

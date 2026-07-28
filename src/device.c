@@ -272,6 +272,7 @@ static void v1000_task_body(void)
         (void)IExec->Wait(wait_mask);
         if (IExec->SetSignal(0, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) break;
         IExec->SetSignal(0, sig_mask);   /* consume all pending IRQ signals */
+        base->task_wake_count++;
         v1000_process_rx(base);
     }
 
@@ -386,9 +387,11 @@ static void v1000_process_rx(struct Virte1000Base *base)
     struct ExecIFace *IExec = base->IExec;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
+    ULONG dd_seen_this_call = 0;
     for (int slot = 0; slot < V1000_RING_ENTRIES; slot++) {
         volatile UBYTE *rd = (volatile UBYTE *)base->rx_ring + slot * V1000_DESC_SIZE;
         if (!(rd[12] & 0x01)) continue;    /* not done */
+        dd_seen_this_call++;
 
         ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
         if (frame_len < 14 || frame_len > V1000_RX_BUFSIZE) {
@@ -414,6 +417,7 @@ static void v1000_process_rx(struct Virte1000Base *base)
         }
         IExec->ReleaseSemaphore(&base->opener_lock);
 
+        BOOL delivered_this_slot = FALSE;
         if (ioreq && op && op->copy_to_buff && ioreq->ios2_Data) {
             /* Populate ios2 fields, invoke CopyToBuff hook, reply. */
             for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
@@ -431,12 +435,15 @@ static void v1000_process_rx(struct Virte1000Base *base)
                 (struct Hook *)op->copy_to_buff, ioreq, &msg);
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
+            delivered_this_slot = ok;
         }
+        if (delivered_this_slot) base->process_rx_delivered++;
         /* Whether we delivered or not, free the slot for HW reuse. */
         rd[12] = 0;
         /* Bump RDT to hand this slot back. */
         e1000_write32(mmio, E1000_REG_RDT, slot);
     }
+    base->process_rx_dd_seen = dd_seen_this_call;
 }
 
 /* -------- Phase 5b: ISR ----------
@@ -1194,6 +1201,8 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
  * MAC while online would need offline-then-online semantics, for
  * example). */
 #define E1000_RCTL_EN     (1U << 1)
+#define E1000_RCTL_UPE    (1U << 3)   /* Unicast Promiscuous — accept any dst MAC */
+#define E1000_RCTL_MPE    (1U << 4)   /* Multicast Promiscuous — accept any multicast */
 #define E1000_RCTL_BAM    (1U << 15)
 #define E1000_RCTL_SECRC  (1U << 26)
 #define E1000_TCTL_EN     (1U << 1)
@@ -1208,7 +1217,12 @@ static void v1000_online_hw(struct Virte1000Base *base)
 {
     if (!base->bar0) return;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
-    e1000_write32(mmio, E1000_REG_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+    /* Phase 6l: enable UPE/MPE to eliminate RCTL filtering as a suspect —
+     * MAC-filter miss would silently drop the ARP reply from QEMU. With
+     * promiscuous on, any frame QEMU sends to the wire lands in the ring. */
+    e1000_write32(mmio, E1000_REG_RCTL,
+                  E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE
+                  | E1000_RCTL_BAM | E1000_RCTL_SECRC);
     e1000_write32(mmio, E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP
                                        | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40));
     e1000_write32(mmio, E1000_REG_IMS, E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
@@ -1426,6 +1440,24 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_DstAddr[3] = (UBYTE)(dd_count);
             ioreq->ios2_DstAddr[4] = (UBYTE)(first_len >> 8);
             ioreq->ios2_DstAddr[5] = (UBYTE)(first_len);
+            /* Phase 6l task-path diagnostics: */
+            ioreq->ios2_DstAddr[6]  = (UBYTE)(devBase->task_wake_count >> 8);
+            ioreq->ios2_DstAddr[7]  = (UBYTE)(devBase->task_wake_count);
+            ioreq->ios2_DstAddr[8]  = (UBYTE)(devBase->process_rx_dd_seen >> 8);
+            ioreq->ios2_DstAddr[9]  = (UBYTE)(devBase->process_rx_dd_seen);
+            ioreq->ios2_DstAddr[10] = (UBYTE)(devBase->process_rx_delivered >> 8);
+            ioreq->ios2_DstAddr[11] = (UBYTE)(devBase->process_rx_delivered);
+        }
+        break;
+    }
+
+    case V1000_DBG_DUMPTX: {
+        /* Dump first 16 bytes of the last-built cooked TX frame so callers
+         * can eyeball the on-wire framing (Ethernet dst/src/etype + start
+         * of payload). Overloads ios2_SrcAddr[0..15]. */
+        if (devBase->tx_scratch) {
+            UBYTE *s = (UBYTE *)devBase->tx_scratch;
+            for (int i = 0; i < 16; i++) ioreq->ios2_SrcAddr[i] = s[i];
         }
         break;
     }
