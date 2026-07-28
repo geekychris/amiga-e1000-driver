@@ -1,24 +1,28 @@
 /*
- * testtx — SKIPPED (CMD_WRITE dispatch mystery documented in
- *                    memory os4-doio-ioflags-quirks).
+ * testtx — SKIPPED. CMD_WRITE dispatch mystery documented in memory
+ *          os4-doio-ioflags-quirks and in the CMD_WRITE case comment
+ *          in device.c.
  *
- * Even after Phase 6d's Unit refactor (real embedded struct Unit with
- * PA_IGNORE MsgPort, valid MsgList, UNITF_ACTIVE), OS4 exec still
- * returns IOERR_UNITBUSY (-6) for CMD_WRITE (and S2_BROADCAST, and
- * an arbitrary private io_Command 0xF010) BEFORE calling our BeginIO.
+ * Summary: OS4 exec returns IOERR_UNITBUSY (-6) for CMD_WRITE and
+ * S2_BROADCAST and arbitrary private commands (0xF010) BEFORE the
+ * driver's BeginIO runs. Confirmed via direct IExec->BeginIO too, so
+ * the rejection is inside exec's dispatch, not DoIO's routing.
+ *
+ * Tried and did not help:
+ *   - real embedded struct Unit with proper MsgPort + MsgList
+ *   - UNITF_ACTIVE, UNITF_INTASK
+ *   - PA_IGNORE vs PA_SIGNAL with FindTask(NULL) SigTask
+ *   - setting ios2_SrcAddr non-NULL (in case exec reads it as io_Data)
+ *   - bypassing DoIO via IExec->BeginIO
+ *   - setting io_Flags = IOF_QUICK explicitly
+ *
  * DEVICEQUERY, GETSTATIONADDRESS, CONFIGINTERFACE, ONLINE, OFFLINE,
  * and private DBG_STATUS/FIRE_IRQ all dispatch fine with the same
- * setup — so it's io_Command-specific but not a simple "numeric
- * range" filter. Even calling IExec->BeginIO directly (bypassing DoIO)
- * returns -6, so the rejection is inside exec's dispatch layer, not
- * DoIO's routing.
- *
- * The CMD_WRITE code in device.c is structurally correct — it
- * builds a TX descriptor, bumps TDT, polls for STATUS.DD, and would
- * happily send a frame if only exec would let it. Unblocking probably
- * needs reading a shipping OS4 SANA-II driver source (rtl8139.device
- * being the obvious candidate) to see what unit_flags / MsgPort setup
- * / interface trick they use.
+ * driver setup — so exec's discriminator is io_Command-based but not
+ * a simple range filter. The CMD_WRITE code in device.c is
+ * structurally correct; it just cannot be reached until we work out
+ * what OS4 exec requires. Real next move: read rtl8139.device source
+ * (OS4Depot) or another shipping OS4 SANA-II driver.
  */
 
 #include <exec/errors.h>
@@ -31,9 +35,9 @@
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    IDOS->Printf("testtx: SKIP - CMD_WRITE hits exec IOERR_UNITBUSY (-6) even with\n"
-                 "        a real struct Unit + PA_IGNORE/PA_SIGNAL + UNITF_ACTIVE.\n"
-                 "        Root cause needs reading rtl8139.device or equivalent.\n");
+    IDOS->Printf("testtx: SKIP - CMD_WRITE hits exec IOERR_UNITBUSY (-6).\n"
+                 "        See memory os4-doio-ioflags-quirks for the full "
+                 "diagnostic log.\n");
     IDOS->Printf("RESULT: PASS\n");
     return 0;
 }
