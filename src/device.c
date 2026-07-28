@@ -1090,14 +1090,24 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
         devBase->IExec->DebugPrintF("[virte1000] Open: opener alloc failed\n");
         /* Continue anyway — testopen etc. don't rely on opener state. */
     } else {
-        op->bm_cookie = ioreq->ios2_BufferManagement;
-        if (op->bm_cookie && devBase->IUtility) {
-            struct TagItem *tags = (struct TagItem *)op->bm_cookie;
+        /* SANA-II Rev 4: the caller passes a TAG LIST in
+         * ios2_BufferManagement at OpenDevice; the driver parses it,
+         * allocates per-opener state, and *replaces*
+         * ios2_BufferManagement with an opaque driver-side cookie
+         * that the caller carries back on every subsequent IORequest.
+         * The Rev 7 Roadshow client stops issuing IO if the driver
+         * doesn't do this rewrite — that was the "No buffer space
+         * available" AddNetInterface failure. Use our own opener
+         * pointer as the cookie so lookup is O(1) and unambiguous. */
+        struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
+        if (tags && devBase->IUtility) {
             op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
                 S2_CopyFromBuff, 0, tags);
             op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
                 S2_CopyToBuff, 0, tags);
         }
+        op->bm_cookie = (APTR)op;   /* self-referential cookie */
+        ioreq->ios2_BufferManagement = (APTR)op;
         devBase->IExec->NewList((struct List *)&op->read_queue);
         devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
         devBase->IExec->AddTail((struct List *)&devBase->opener_list,
