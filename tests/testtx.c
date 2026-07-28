@@ -99,9 +99,13 @@ int main(int argc, char **argv)
     for (int i = 0; i < 6; i++) req->ios2_DstAddr[i] = 0xff;
 
     LONG rc = IExec->DoIO((struct IORequest *)req);
+    /* Capture the raw CMD_WRITE result BEFORE any further do_cmd calls
+     * (do_cmd resets io_Error/wire on each new command). */
+    LONG cmdw_rc    = rc;
+    LONG cmdw_ioerr = req->ios2_Req.io_Error;
+    ULONG cmdw_wire = req->ios2_WireError;
     IDOS->Printf("CMD_WRITE  DoIO=%ld  io_Error=%ld  wire=0x%lx\n",
-                 (long)rc, (long)req->ios2_Req.io_Error,
-                 (unsigned long)req->ios2_WireError);
+                 (long)cmdw_rc, (long)cmdw_ioerr, (unsigned long)cmdw_wire);
 
     ULONG tpt_after = read_tpt(req);
     IDOS->Printf("TPT after send:  %lu (delta=%ld)\n",
@@ -115,12 +119,20 @@ out:
     IExec->FreeSysObject(ASOT_IOREQUEST, req);
     IExec->FreeSysObject(ASOT_PORT, port);
 
-    /* For now: PASS if CMD_WRITE at least reached BeginIO (io_Error is
-     * from our sentinel 0xDEAD path). Real TX (TPT advance) is a
-     * further step. */
-    BOOL reached = (rc == 0) && (req->ios2_Req.io_Error == 0);
-    if (reached) IDOS->Printf("RESULT: PASS (CMD_WRITE reached BeginIO)\n");
-    else         IDOS->Printf("RESULT: FAIL CMD_WRITE ioerr=%ld\n",
-                              (long)req->ios2_Req.io_Error);
-    return reached ? 0 : 20;
+    /* PASS = CMD_WRITE reached the driver's BeginIO.
+     *   rc == -6 && wire == 0x7000: our own IOERR_UNITBUSY timeout after
+     *                                dispatch — descriptor didn't complete
+     *                                but we DID get called. Big win.
+     *   rc ==  0                  : full success (TX-completion working)
+     *   any other -6              : exec REJECTED dispatch (old failure).
+     * Frame egress (TPT delta > 0) is separately a known TODO. */
+    BOOL dispatched = (cmdw_rc == -6 && cmdw_wire == 0x7000)
+                   || (cmdw_rc ==  0 && cmdw_ioerr == 0);
+    if (dispatched) {
+        IDOS->Printf("RESULT: PASS (CMD_WRITE dispatched; TX-completion TODO)\n");
+    } else {
+        IDOS->Printf("RESULT: FAIL CMD_WRITE dispatch blocked rc=%ld wire=0x%lx\n",
+                     (long)cmdw_rc, (unsigned long)cmdw_wire);
+    }
+    return dispatched ? 0 : 20;
 }

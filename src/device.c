@@ -1104,27 +1104,17 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         devBase->tx_next_slot = new_tdt;
         ioreq->ios2_WireError = 0x6000;
 
-        /* Poll for STATUS.DD. Two-phase:
-         *   1. Tight loop (fast, catches near-immediate completion)
-         *   2. Delay-based (gives HW real wall-clock time to process
-         *      through QEMU's e1000 emulation) */
+        /* Poll for STATUS.DD, bounded. TX-completion is currently
+         * broken: HW consumes the descriptor (TDH advances) but the
+         * DD writeback isn't visible to us. Tried IExec->CachePreDMA/
+         * CachePostDMA — hangs the driver. Likely a PPC data-cache
+         * coherency issue that needs a different primitive (StartDMA?
+         * MEMF_NO_CACHE if such exists?) or a proper interrupt-driven
+         * wait via TXDW rather than polling. TODO Phase 6g. */
         BOOL done = FALSE;
-        for (int i = 0; i < 1000000; i++) {
+        for (int i = 0; i < 10000; i++) {
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
             __asm__ volatile ("" : : : "memory");
-        }
-        if (!done) {
-            /* Slow path via dos.library/Delay — 1/50 sec per tick.
-             * Wait up to 10 ticks = 200 ms total. */
-            struct Library *DOSBase = IExec->OpenLibrary("dos.library", 51);
-            struct DOSIFace *IDOS = NULL;
-            if (DOSBase) IDOS = (struct DOSIFace *)IExec->GetInterface(DOSBase, "main", 1, NULL);
-            for (int i = 0; !done && i < 10; i++) {
-                if (IDOS) IDOS->Delay(1);
-                if (d[12] & E1000_TXD_STAT_DD) done = TRUE;
-            }
-            if (IDOS) IExec->DropInterface((struct Interface *)IDOS);
-            if (DOSBase) IExec->CloseLibrary(DOSBase);
         }
         /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
          * TCTL — so testtx can see what HW did. */
