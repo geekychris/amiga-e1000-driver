@@ -3,6 +3,7 @@
 
 #include <exec/devices.h>
 #include <exec/interfaces.h>
+#include <exec/interrupts.h>  /* struct Interrupt */
 #include <exec/io.h>
 #include <exec/libraries.h>
 #include <exec/semaphores.h>
@@ -51,6 +52,17 @@ struct Virte1000Base
     APTR    rx_ring;      /* 16 × 16-byte descriptors */
     APTR    tx_ring;      /* 16 × 16-byte descriptors */
     APTR    rx_buffers;   /* 16 × 2KB pool; per-descriptor slices */
+
+    /* Phase 5: PCI INTx interrupt handler. irq_installed guards Expunge
+     * so we RemIntServer only if AddIntServer succeeded. irq_counter and
+     * last_icr are updated by the ISR on every fire — read from user
+     * context (test programs) via a private query command. Volatile so
+     * a spinning reader sees new values. */
+    struct Interrupt irq_node;
+    ULONG            irq_vector;
+    BOOL             irq_installed;
+    volatile ULONG   irq_counter;
+    volatile ULONG   last_icr;
 };
 
 #endif

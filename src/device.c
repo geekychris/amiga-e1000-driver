@@ -167,6 +167,7 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 #define E1000_REG_CTRL     0x00000
 #define E1000_REG_STATUS   0x00008
 #define E1000_REG_ICR      0x000C0   /* Interrupt Cause Read (RO/read-to-clear) */
+#define E1000_REG_ICS      0x000C8   /* Interrupt Cause Set (WO, forces IRQ) */
 #define E1000_REG_IMS      0x000D0   /* Interrupt Mask Set */
 #define E1000_REG_IMC      0x000D8   /* Interrupt Mask Clear (WO, write 1 to mask) */
 #define E1000_REG_RCTL     0x00100   /* Receive Control */
@@ -189,6 +190,44 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 static inline void poke_le32(volatile void *p, uint32 v)
 {
     __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "r"(p) : "memory");
+}
+
+/* Forward decl — real definitions live further down with the other MMIO
+ * helpers. The ISR below needs to call e1000_read32(ICR). */
+static inline uint32 e1000_read32(volatile void *base, uint32 off);
+
+/* -------- Phase 5b: ISR ----------
+ * Runs at exec interrupt level on the shared PCI INTx chain. Contract per
+ * exec IntServer autodoc + VirtualSCSIDevice's virtio_irq.c:
+ *   - No memory allocation, no blocking, no library calls beyond IExec
+ *     essentials (Signal/Cause/similar).
+ *   - No DebugPrintF (deadlock risk).
+ *   - Return non-zero if we recognised and claimed this interrupt;
+ *     return zero to let the next server on the chain look at it.
+ *
+ * Reading ICR both TELLS us what fired AND acknowledges the causes
+ * (read-to-clear per DESIGN.md §6). We stash the last non-zero value
+ * in devBase->last_icr for post-hoc inspection by test programs;
+ * they read it via the driver-private query command added in Phase 5e.
+ *
+ * When IMS is 0 (Phase 5b) no cause is unmasked so ICR reads here
+ * should be 0 and we always return 0 (not-ours). That's the safest
+ * starting point: we're on the chain but never claim, so an install
+ * bug can't storm. */
+static uint32 v1000_isr(struct ExceptionContext *ctx,
+                        struct ExecBase *sysbase, APTR is_Data)
+{
+    struct Virte1000Base *base = (struct Virte1000Base *)is_Data;
+    (void)ctx; (void)sysbase;
+
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+    uint32 icr = e1000_read32(mmio, E1000_REG_ICR);
+    if (icr == 0)
+        return 0;               /* not ours (or nothing pending) */
+
+    base->irq_counter++;
+    base->last_icr = icr;
+    return 1;                   /* claimed */
 }
 
 /* STATUS register bits (§2 of DESIGN.md, e1000x_regs.h:STATUS_*) */
@@ -280,6 +319,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->rx_ring       = NULL;
     devBase->tx_ring       = NULL;
     devBase->rx_buffers    = NULL;
+    devBase->irq_vector    = 0;
+    devBase->irq_installed = FALSE;
+    devBase->irq_counter   = 0;
+    devBase->last_icr      = 0;
     for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
 
     devBase->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
@@ -623,6 +666,66 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
+    /* -------- Phase 5a+b: map + install IRQ handler ----------
+     * MapInterrupt resolves config-space InterruptLine to a system vector.
+     * Then AddIntServer chains us on the shared PCI INTx server list.
+     * IMS still 0 (all sources masked) — Phase 5c unmasks LSC below. */
+    if (devBase->pciDevice) {
+        devBase->irq_vector = devBase->pciDevice->MapInterrupt();
+        LOGF(log, (CONST_STRPTR)"MapInterrupt: vector=%lu\n", devBase->irq_vector);
+
+        if (devBase->irq_vector != 0) {
+            devBase->irq_node.is_Node.ln_Type = NT_INTERRUPT;
+            devBase->irq_node.is_Node.ln_Pri  = 0;
+            devBase->irq_node.is_Node.ln_Name = (STRPTR)DEVNAME;
+            devBase->irq_node.is_Data         = (APTR)devBase;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+            devBase->irq_node.is_Code = (VOID (*)())v1000_isr;
+#pragma GCC diagnostic pop
+
+            BOOL ok = iexec->AddIntServer(devBase->irq_vector, &devBase->irq_node);
+            devBase->irq_installed = ok;
+            LOGF(log, (CONST_STRPTR)"AddIntServer: vec=%lu result=%s\n",
+                 devBase->irq_vector, ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
+        } else {
+            LOGF(log, (CONST_STRPTR)"MapInterrupt returned 0 — no IRQ hooked\n");
+        }
+    }
+
+    /* -------- Phase 5c+d: unmask LSC + RXT0 + TXDW; verify with ICS ----
+     * LSC  (bit 2) — Link Status Change (spontaneous, but not without a
+     *                link event; QEMU never toggles it after boot).
+     * RXT0 (bit 7) — Receive Timer; RX packet(s) delivered.
+     * TXDW (bit 0) — TX Descriptor Written back.
+     * Full production mask. As a sanity check we then poke ICS.LSC to
+     * synthesise one interrupt and confirm the ISR ran (counter++). */
+#define E1000_INTR_TXDW    (1U << 0)
+#define E1000_INTR_LSC     (1U << 2)
+#define E1000_INTR_RXT0    (1U << 7)
+    if (devBase->irq_installed && devBase->bar0) {
+        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+
+        ULONG before_cnt = devBase->irq_counter;
+        e1000_write32(mmio, E1000_REG_IMS,
+                      E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
+        ULONG after_ims_cnt = devBase->irq_counter;
+
+        /* ICS-forced fire proves the whole PIC → IntServer → ISR chain
+         * without needing real packet traffic. */
+        e1000_write32(mmio, E1000_REG_ICS, E1000_INTR_LSC);
+
+        /* Busy-wait for counter to move (or fall through after ~100k
+         * iters if the interrupt didn't materialise). Reading ICR here
+         * would consume causes and hide the actual state. */
+        for (int i = 0; i < 100000 && devBase->irq_counter == after_ims_cnt; i++)
+            __asm__ volatile ("" : : : "memory");
+
+        LOGF(log, (CONST_STRPTR)"IRQ test: cnt before-IMS=%lu after-IMS=%lu after-ICS=%lu last_icr=%08lx\n",
+             (ULONG)before_cnt, (ULONG)after_ims_cnt,
+             (ULONG)devBase->irq_counter, (ULONG)devBase->last_icr);
+    }
+
     v1000_log_close(iexec, &log);
     return (struct Library *)devBase;
 }
@@ -692,15 +795,22 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
         seglist = devBase->dev_SegList;
         IExec->Remove((struct Node *)devBase);
 
-        /* Release PCI-side resources in reverse-acquire order. Every field
-         * may be NULL if Init bailed early — check each.
+        /* Release resources in reverse-acquire order.
          *
-         * Free rings + buffers first so if the device is still bus-mastering
-         * against them (shouldn't be, IRQs are masked and RX/TX disabled)
-         * we at least tear down the ring pointers before the memory gets
-         * handed back to the pool. Ideal order needs a full HW quiesce
-         * first; that's Phase 4a's job at Init and we'll add a matching
-         * quiesce-before-teardown once we're actually running the device. */
+         * FIRST: mask interrupts + remove the IntServer so a late-arriving
+         * interrupt can't dereference base fields we're about to free.
+         * Since IMS is only touched from Init (masked with IMC there),
+         * this write may be a no-op — but the RemIntServer must happen. */
+        if (devBase->bar0) {
+            volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+            e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);   /* mask all */
+            (void)e1000_read32(mmio, E1000_REG_ICR);            /* clear pending */
+        }
+        if (devBase->irq_installed) {
+            IExec->RemIntServer(devBase->irq_vector, &devBase->irq_node);
+            devBase->irq_installed = FALSE;
+        }
+
         if (devBase->rx_buffers) { IExec->FreeVec(devBase->rx_buffers); devBase->rx_buffers = NULL; }
         if (devBase->tx_ring)    { IExec->FreeVec(devBase->tx_ring);    devBase->tx_ring    = NULL; }
         if (devBase->rx_ring)    { IExec->FreeVec(devBase->rx_ring);    devBase->rx_ring    = NULL; }
@@ -767,6 +877,18 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         q->BPS            = 1000000000UL;
         q->HardwareType   = S2WireType_Ethernet;
         q->RawMTU         = 1514;
+        break;
+    }
+
+    case 0xF001: {
+        /* virte1000 private: return runtime IRQ counters. Not in any SANA-II
+         * or exec command range (0..0x38, 0xC000..). Used only by testirq.
+         * Overloads reply fields:
+         *   ios2_DataLength = irq_counter (total ISR fires since Init)
+         *   ios2_WireError  = last_icr    (bitmap of last observed causes)
+         */
+        ioreq->ios2_DataLength = devBase->irq_counter;
+        ioreq->ios2_WireError  = devBase->last_icr;
         break;
     }
 
