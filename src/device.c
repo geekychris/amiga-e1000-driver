@@ -1079,15 +1079,16 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         }
         ioreq->ios2_WireError = 0x3000;   /* passed len check */
 
-        /* Copy caller's frame into the RX buffer pool at the same slot
-         * index we'll use for the TX descriptor. rx_buffers is 16 × 2KB. */
+        /* Copy caller's frame into the RX buffer pool. */
         ULONG slot = devBase->tx_next_slot;
         UBYTE *dst = (UBYTE *)devBase->rx_buffers + (slot * V1000_RX_BUFSIZE);
         UBYTE *src = (UBYTE *)ioreq->ios2_Data;
         for (ULONG i = 0; i < len; i++) dst[i] = src[i];
-        ioreq->ios2_WireError = 0x4000;
 
-        /* Build descriptor at tx_ring[slot]. All 16 bytes LE. */
+        /* Build descriptor at tx_ring[slot]. All 16 bytes LE.
+         * On sam460ex the MMU is either off or identity-mapping RAM
+         * for our purposes, so CPU-virtual dst also serves as the
+         * PCI-bus address — no CachePreDMA translation needed. */
         volatile UBYTE *d = (volatile UBYTE *)devBase->tx_ring + (slot * V1000_DESC_SIZE);
         poke_le32(d +  0, (uint32)(ULONG)dst);
         poke_le32(d +  4, 0);
@@ -1095,26 +1096,27 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                           | ((uint32)(E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS
                                       | E1000_TXD_CMD_RS) << 24));
         poke_le32(d + 12, 0);
-        ioreq->ios2_WireError = 0x5000;
+
+        /* Flush data cache for the frame + descriptor so DMA sees our
+         * writes. CacheClearE with CACRF_ClearD (bit 0) does a range
+         * flush without the CachePreDMA overhead that was hanging us. */
+        IExec->CacheClearE(dst, len, 1 /* CACRF_ClearD */);
+        IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, 1);
 
         /* Bump TDT — TX doorbell. HW starts pulling. */
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
         ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
         e1000_write32(mmio, E1000_REG_TDT, new_tdt);
         devBase->tx_next_slot = new_tdt;
-        ioreq->ios2_WireError = 0x6000;
 
-        /* Poll for STATUS.DD, bounded. TX-completion is currently
-         * broken: HW consumes the descriptor (TDH advances) but the
-         * DD writeback isn't visible to us. Tried IExec->CachePreDMA/
-         * CachePostDMA — hangs the driver. Likely a PPC data-cache
-         * coherency issue that needs a different primitive (StartDMA?
-         * MEMF_NO_CACHE if such exists?) or a proper interrupt-driven
-         * wait via TXDW rather than polling. TODO Phase 6g. */
+        /* Poll for STATUS.DD. Invalidate the descriptor's cache line
+         * each iteration via CacheClearE (bit 2 = CACRF_InvalidateD). */
         BOOL done = FALSE;
-        for (int i = 0; i < 10000; i++) {
+        for (int i = 0; i < 100; i++) {
+            IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, 4 /* CACRF_InvalidateD */);
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
-            __asm__ volatile ("" : : : "memory");
+            /* small busy delay between checks — no dos.library needed */
+            for (volatile int j = 0; j < 1000; j++) { __asm__ volatile ("" ::: "memory"); }
         }
         /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
          * TCTL — so testtx can see what HW did. */
