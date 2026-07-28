@@ -101,5 +101,9 @@ struct Virte1000Base
  * ranges, so no chance of colliding with a spec command. */
 #define V1000_DBG_STATUS   0xF001   /* returns counter/icr/state */
 #define V1000_DBG_FIRE_IRQ 0xF002   /* ICS.LSC → forces one ISR call */
+#define V1000_DBG_SEND     0xF003   /* send raw L2 frame from ios2_Data
+                                     * of ios2_DataLength bytes; workaround
+                                     * for CMD_WRITE being blocked by
+                                     * exec's dispatch layer */
 
 #endif

@@ -987,30 +987,39 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
+    case V1000_DBG_SEND:
     case CMD_WRITE:
     case S2_BROADCAST: {
-        /* Phase 6b: RAW-only TX. Cooked mode (driver builds Ethernet
-         * header + calls CopyFromBuff for payload) lands in Phase 6c
-         * once per-opener state + copy hooks are wired.
+        /* Phase 6b/e/f — TX PARTIALLY IMPLEMENTED, blocked on two issues:
          *
-         * Caller MUST use SendIO + WaitIO rather than DoIO — DoIO
-         * unconditionally replaces io_Flags with IOF_QUICK, wiping the
-         * SANA2IOF_RAW bit and causing us to reject the request. */
-
-        /* Known issue: this case is currently UNREACHABLE via DoIO or
-         * SendIO from user code, because we set io_Unit to a fake
-         * pointer (Virte1000Base cast) in Open. OS4 exec appears to
-         * route CMD_WRITE (io_Command==3) through io_Unit->unit_MsgPort
-         * for queueing, which reads garbage and returns IOERR_UNITBUSY
-         * (-6) before ever calling BeginIO. Fix requires allocating a
-         * real struct Unit per open with a valid MsgPort — Phase 6d.
-         * The code below is correct for when we can reach it. */
+         *   1. CMD_WRITE (io_Command=3) and S2_BROADCAST (17) never reach
+         *      this case via DoIO/SendIO/direct-BeginIO — OS4 exec rejects
+         *      with IOERR_UNITBUSY (-6) before dispatch. Discriminator is
+         *      io_Command-value based; not io_Flags, not io_Unit struct,
+         *      not MsgPort mode. Private cmds 0xF001..0xF003 dispatch
+         *      fine, 0xF010 doesn't. See memory os4-doio-ioflags-quirks.
+         *
+         *   2. Even when reached via V1000_DBG_SEND (0xF003), the full TX
+         *      code path either drops the descriptor silently (TDH advances
+         *      but STATUS.DD never sets, TPT stays 0) or hangs the caller
+         *      when we add IExec->CachePreDMA/CachePostDMA. Root cause
+         *      not identified.
+         *
+         * Current behavior: report dispatch success but do nothing. Real
+         * TX code lives in the #if 0 block below, preserved for the next
+         * debugging session. */
 
         if (devBase->state != V1000_STATE_ONLINE) {
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
             break;
         }
+        /* Sentinel so caller can distinguish "dispatch worked" from the
+         * -6 that would happen if exec blocked us. */
+        ioreq->ios2_WireError = 0xDEAD;
+        break;
+#if 0 /* preserved for next session's debugging */
+        ioreq->ios2_WireError = 0x2000;   /* passed state check */
 
         /* Frame length sanity: 60 bytes minimum (pad-to-min handled by
          * PSP in TCTL) up to RawMTU=1514. */
@@ -1021,48 +1030,63 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
             break;
         }
+        ioreq->ios2_WireError = 0x3000;   /* passed len check */
 
         /* Copy caller's frame into the RX buffer pool at the same slot
-         * index we'll use for the TX descriptor. rx_buffers is 16 × 2KB,
-         * plenty of room for a 1514-byte frame. This shares the RX buffer
-         * area for TX until Phase 6c gives TX its own pool. */
+         * index we'll use for the TX descriptor. rx_buffers is 16 × 2KB. */
         ULONG slot = devBase->tx_next_slot;
         UBYTE *dst = (UBYTE *)devBase->rx_buffers + (slot * V1000_RX_BUFSIZE);
         UBYTE *src = (UBYTE *)ioreq->ios2_Data;
         for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+        ioreq->ios2_WireError = 0x4000;
 
         /* Build descriptor at tx_ring[slot]. All 16 bytes LE. */
         volatile UBYTE *d = (volatile UBYTE *)devBase->tx_ring + (slot * V1000_DESC_SIZE);
-        poke_le32(d +  0, (uint32)(ULONG)dst);        /* addr low  */
-        poke_le32(d +  4, 0);                          /* addr high */
-        /* word at bytes 8..11: length in low16, cso(byte10)=0, cmd(byte11) */
+        poke_le32(d +  0, (uint32)(ULONG)dst);
+        poke_le32(d +  4, 0);
         poke_le32(d +  8, (uint32)len
-                          | ((uint32)0 << 16)          /* CSO */
                           | ((uint32)(E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS
                                       | E1000_TXD_CMD_RS) << 24));
-        poke_le32(d + 12, 0);                          /* status=0, css=0, special=0 */
+        poke_le32(d + 12, 0);
+        ioreq->ios2_WireError = 0x5000;
 
-        /* Bump TDT — this is the TX doorbell. HW starts pulling. */
+        /* Bump TDT — TX doorbell. HW starts pulling. */
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
         ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
         e1000_write32(mmio, E1000_REG_TDT, new_tdt);
         devBase->tx_next_slot = new_tdt;
+        ioreq->ios2_WireError = 0x6000;
 
-        /* Poll for the descriptor to complete. Bounded so a broken HW
-         * emulation doesn't lock the caller task forever. On QEMU sam460ex
-         * the send is synchronous — typically completes within a few
-         * iterations. */
+        /* Poll for STATUS.DD, bounded to a few thousand iters. On QEMU
+         * this should complete near-immediately if HW likes our
+         * descriptor; if not, timing out is faster than blocking. */
         BOOL done = FALSE;
-        for (int i = 0; i < 100000; i++) {
+        for (int i = 0; i < 10000; i++) {
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
             __asm__ volatile ("" : : : "memory");
         }
+        /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
+         * TCTL — so testtx can see what HW did. */
+        uint32 tdh_now  = e1000_read32(mmio, E1000_REG_TDH);
+        uint32 tdt_now  = e1000_read32(mmio, E1000_REG_TDT);
+        uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
+        UBYTE  stat_byte = d[12];
+        /* Pack into ios2 fields:
+         *   ios2_DataLength = TDH | (TDT << 16)
+         *   ios2_PacketType = tctl
+         *   ios2_WireError  = status_byte | (done << 8) | 0x7000
+         */
+        ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
+        ioreq->ios2_PacketType = tctl_now;
+        ioreq->ios2_WireError  = ((ULONG)stat_byte)
+                               | ((ULONG)(done ? 1 : 0) << 8)
+                               | 0x7000;
 
         if (!done) {
             ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
-            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
         }
         break;
+#endif
     }
 
     case S2_GETSTATIONADDRESS: {
