@@ -25,6 +25,8 @@
 #include <exec/errors.h>
 #include <exec/execbase.h>
 
+#include <devices/newstyle.h>   /* NSCMD_DEVICEQUERY + NSDeviceQueryResult */
+
 #include <dos/dos.h>
 #include <interfaces/dos.h>
 
@@ -161,6 +163,32 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 /* Intel 82540EM as emulated by QEMU's -device e1000-82540em. */
 #define E1000_PCI_VENDOR   0x8086
 #define E1000_PCI_DEVICE   0x100E
+
+/* NSCMD_DEVICEQUERY supported-commands list. Standard NSD idiom
+ * (see daynaport-amiga/device.c for the pattern). OS4 exec MAY be
+ * pre-checking this list before dispatching CMD_WRITE / S2_BROADCAST
+ * / other "standard-range" io_Commands to us — that's the current
+ * theory for why those cases returned IOERR_UNITBUSY (-6) before
+ * BeginIO ran. Terminated by 0.
+ *
+ * If any client asks for a command not in this list, we still
+ * dispatch it (BeginIO's switch handles it or falls to
+ * IOERR_NOCMD) — the list is just what we ADVERTISE. */
+static const UWORD v1000_supported_cmds[] = {
+    NSCMD_DEVICEQUERY,
+    CMD_READ,
+    CMD_WRITE,
+    S2_DEVICEQUERY,
+    S2_GETSTATIONADDRESS,
+    S2_CONFIGINTERFACE,
+    S2_ONLINE,
+    S2_OFFLINE,
+    S2_BROADCAST,
+    S2_READORPHAN,
+    S2_ONEVENT,
+    S2_GETGLOBALSTATS,
+    0
+};
 
 /* e1000 register offsets we currently touch. Full map lives in the QEMU
  * source at hw/net/e1000_regs.h + the 82540EM datasheet; only the offsets
@@ -888,6 +916,31 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
+    case NSCMD_DEVICEQUERY: {
+        /* New-style device query — Roadshow and other stack layers call
+         * this to enumerate supported commands. OS4 exec may ALSO be
+         * calling it internally before dispatching commands, then rejecting
+         * anything not in the list with IOERR_UNITBUSY. Format from
+         * <devices/newstyle.h>: caller sets ios2_Data (via IOStdReq view:
+         * io_Data at offset 40 = ios2_SrcAddr[0..3] here — but Roadshow
+         * uses IOStdReq, not IOSana2Req, for this call, so we access
+         * fields through the IOStdReq layout). */
+        struct IOStdReq *sreq = (struct IOStdReq *)ioreq;
+        ULONG want = sizeof(struct NSDeviceQueryResult);
+        if (!sreq->io_Data || sreq->io_Length < want) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            break;
+        }
+        struct NSDeviceQueryResult *r = (struct NSDeviceQueryResult *)sreq->io_Data;
+        r->DevQueryFormat    = 0;
+        r->SizeAvailable     = want;
+        r->DeviceType        = NSDEVTYPE_SANA2;
+        r->DeviceSubType     = 0;
+        r->SupportedCommands = (UWORD *)v1000_supported_cmds;
+        sreq->io_Actual      = want;
+        break;
+    }
+
     case V1000_DBG_STATUS: {
         /* virte1000 private: return runtime state to test programs.
          * Not in any SANA-II (< 0x38) or new-style (0xC000+) range.
@@ -1014,12 +1067,6 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
             break;
         }
-        /* Sentinel so caller can distinguish "dispatch worked" from the
-         * -6 that would happen if exec blocked us. */
-        ioreq->ios2_WireError = 0xDEAD;
-        break;
-#if 0 /* preserved for next session's debugging */
-        ioreq->ios2_WireError = 0x2000;   /* passed state check */
 
         /* Frame length sanity: 60 bytes minimum (pad-to-min handled by
          * PSP in TCTL) up to RawMTU=1514. */
@@ -1057,13 +1104,27 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         devBase->tx_next_slot = new_tdt;
         ioreq->ios2_WireError = 0x6000;
 
-        /* Poll for STATUS.DD, bounded to a few thousand iters. On QEMU
-         * this should complete near-immediately if HW likes our
-         * descriptor; if not, timing out is faster than blocking. */
+        /* Poll for STATUS.DD. Two-phase:
+         *   1. Tight loop (fast, catches near-immediate completion)
+         *   2. Delay-based (gives HW real wall-clock time to process
+         *      through QEMU's e1000 emulation) */
         BOOL done = FALSE;
-        for (int i = 0; i < 10000; i++) {
+        for (int i = 0; i < 1000000; i++) {
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
             __asm__ volatile ("" : : : "memory");
+        }
+        if (!done) {
+            /* Slow path via dos.library/Delay — 1/50 sec per tick.
+             * Wait up to 10 ticks = 200 ms total. */
+            struct Library *DOSBase = IExec->OpenLibrary("dos.library", 51);
+            struct DOSIFace *IDOS = NULL;
+            if (DOSBase) IDOS = (struct DOSIFace *)IExec->GetInterface(DOSBase, "main", 1, NULL);
+            for (int i = 0; !done && i < 10; i++) {
+                if (IDOS) IDOS->Delay(1);
+                if (d[12] & E1000_TXD_STAT_DD) done = TRUE;
+            }
+            if (IDOS) IExec->DropInterface((struct Interface *)IDOS);
+            if (DOSBase) IExec->CloseLibrary(DOSBase);
         }
         /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
          * TCTL — so testtx can see what HW did. */
@@ -1086,7 +1147,6 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
         }
         break;
-#endif
     }
 
     case S2_GETSTATIONADDRESS: {
