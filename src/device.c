@@ -240,6 +240,87 @@ static inline void v1000_wmb(void)
     __asm__ volatile ("sync" : : : "memory");
 }
 
+/* -------- Phase 6k: unit task ---------- */
+
+/* Forward decl for use by ISR. */
+static void v1000_process_rx(struct Virte1000Base *base);
+
+/* Task entry function. Called by CreateTaskTags. Args-less; we recover
+ * our own Task struct via classic-Amiga SysBase-at-4 → FindTask(NULL),
+ * then read tc_UserData for the Virte1000Base pointer. */
+static void v1000_task_body(void)
+{
+    struct ExecIFace *IExec = ((struct ExecIFace *)
+        ((*(struct ExecBase **)4)->MainInterface));
+    struct Task *self = IExec->FindTask(NULL);
+    struct Virte1000Base *base = (struct Virte1000Base *)self->tc_UserData;
+
+    int8 sig = IExec->AllocSignal(-1);
+    if (sig < 0) {
+        base->task_ready_ok = FALSE;
+        IExec->Signal(base->parent_task, base->parent_ready_mask);
+        return;
+    }
+    ULONG sig_mask = 1UL << sig;
+    base->unit_signal_mask = sig_mask;
+    base->task_ready_ok = TRUE;
+    /* Handshake — Init is Wait'ing on parent_ready_mask. */
+    IExec->Signal(base->parent_task, base->parent_ready_mask);
+
+    ULONG wait_mask = sig_mask | SIGBREAKF_CTRL_C;
+    while (!base->task_shutdown) {
+        (void)IExec->Wait(wait_mask);
+        if (IExec->SetSignal(0, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) break;
+        IExec->SetSignal(0, sig_mask);   /* consume all pending IRQ signals */
+        v1000_process_rx(base);
+    }
+
+    /* Cleanup — task exits after this returns. */
+    IExec->FreeSignal(sig);
+    base->unit_signal_mask = 0;
+    base->unit_task = NULL;
+}
+
+/* Called from Init. Spawns the task; waits until task signals ready. */
+static BOOL v1000_task_start(struct Virte1000Base *base, struct ExecIFace *iexec)
+{
+    int8 ready_bit = iexec->AllocSignal(-1);
+    if (ready_bit < 0) return FALSE;
+
+    base->task_shutdown     = FALSE;
+    base->task_ready_ok     = FALSE;
+    base->parent_task       = iexec->FindTask(NULL);
+    base->parent_ready_mask = 1UL << ready_bit;
+
+    iexec->Forbid();
+    struct Task *t = iexec->CreateTaskTags("virte1000-unit", 20,
+                                           v1000_task_body, 8192,
+                                           TAG_END);
+    if (t) t->tc_UserData = (APTR)base;
+    base->unit_task = t;
+    iexec->Permit();
+
+    if (!t) { iexec->FreeSignal(ready_bit); return FALSE; }
+
+    (void)iexec->Wait(base->parent_ready_mask);
+    iexec->FreeSignal(ready_bit);
+    return base->task_ready_ok;
+}
+
+/* Called from Expunge. */
+static void v1000_task_stop(struct Virte1000Base *base, struct ExecIFace *IExec)
+{
+    if (!base->unit_task) return;
+    base->task_shutdown = TRUE;
+    IExec->Signal(base->unit_task, SIGBREAKF_CTRL_C);
+    /* Yield until the task clears itself. */
+    ULONG patience = 100000;
+    while (base->unit_task && patience-- > 0) {
+        IExec->Forbid();
+        IExec->Permit();
+    }
+}
+
 /* Find the opener matching this request's bm_cookie. NULL if none —
  * unusual (Open would have added one), but Close-race-safe. Caller
  * should hold opener_lock (unless within Init/Expunge). */
@@ -283,9 +364,80 @@ static uint32 v1000_dma_phys(struct ExecIFace *IExec, void *virt,
     return phys;
 }
 
-/* Forward decl — real definitions live further down with the other MMIO
- * helpers. The ISR below needs to call e1000_read32(ICR). */
+/* Forward decls — real definitions live further down with the other
+ * MMIO helpers. The ISR below needs to call e1000_read32(ICR); the
+ * Phase 6k v1000_process_rx also uses e1000_write32(RDT). */
 static inline uint32 e1000_read32(volatile void *base, uint32 off);
+static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
+
+/* Ring sizing — used by v1000_process_rx (which is above Init where
+ * these are also referenced during ring alloc). Moved here so both
+ * users see them; keeping the values single-source-of-truth. */
+#define V1000_RING_ENTRIES   16
+#define V1000_DESC_SIZE      16
+#define V1000_RX_BUFSIZE     2048
+
+/* Walk the RX ring, deliver frames to queued CMD_READ requests via the
+ * opener's CopyToBuff hook, reset descriptors + advance RDT so HW can
+ * refill the slot. Called from the unit task on IRQ signal. */
+static void v1000_process_rx(struct Virte1000Base *base)
+{
+    if (!base->rx_ring || !base->bar0 || !base->IUtility) return;
+    struct ExecIFace *IExec = base->IExec;
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+
+    for (int slot = 0; slot < V1000_RING_ENTRIES; slot++) {
+        volatile UBYTE *rd = (volatile UBYTE *)base->rx_ring + slot * V1000_DESC_SIZE;
+        if (!(rd[12] & 0x01)) continue;    /* not done */
+
+        ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
+        if (frame_len < 14 || frame_len > V1000_RX_BUFSIZE) {
+            rd[12] = 0;
+            continue;
+        }
+        UBYTE *rxbuf = (UBYTE *)base->rx_buffers + slot * V1000_RX_BUFSIZE;
+        ULONG payload_len = frame_len - 14;
+
+        /* Find any opener with a queued CMD_READ. First-come, first-serve
+         * for now — no ethertype filtering (Phase 6l). */
+        struct IOSana2Req *ioreq = NULL;
+        struct V1000Opener *op   = NULL;
+        IExec->ObtainSemaphore(&base->opener_lock);
+        for (struct V1000Opener *o = (struct V1000Opener *)base->opener_list.mlh_Head;
+             o->node.mln_Succ;
+             o = (struct V1000Opener *)o->node.mln_Succ) {
+            if (o->read_queue.mlh_Head && o->read_queue.mlh_Head->mln_Succ) {
+                op = o;
+                ioreq = (struct IOSana2Req *)IExec->RemHead((struct List *)&o->read_queue);
+                break;
+            }
+        }
+        IExec->ReleaseSemaphore(&base->opener_lock);
+
+        if (ioreq && op && op->copy_to_buff && ioreq->ios2_Data) {
+            /* Populate ios2 fields, invoke CopyToBuff hook, reply. */
+            for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
+            for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = rxbuf[i];
+            ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+            ioreq->ios2_DataLength = payload_len;
+
+            struct SANA2CopyHookMsg msg;
+            msg.schm_Method  = S2_CopyToBuff;
+            msg.schm_MsgSize = sizeof(msg);
+            msg.schm_To      = ioreq->ios2_Data;
+            msg.schm_From    = rxbuf + 14;
+            msg.schm_Size    = payload_len;
+            BOOL ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
+                (struct Hook *)op->copy_to_buff, ioreq, &msg);
+            ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
+            IExec->ReplyMsg((struct Message *)ioreq);
+        }
+        /* Whether we delivered or not, free the slot for HW reuse. */
+        rd[12] = 0;
+        /* Bump RDT to hand this slot back. */
+        e1000_write32(mmio, E1000_REG_RDT, slot);
+    }
+}
 
 /* -------- Phase 5b: ISR ----------
  * Runs at exec interrupt level on the shared PCI INTx chain. Contract per
@@ -318,6 +470,15 @@ static uint32 v1000_isr(struct ExceptionContext *ctx,
 
     base->irq_counter++;
     base->last_icr = icr;
+
+    /* Phase 6k: on RX (RXT0 bit 7), wake the unit task so it can
+     * ProcessRX in task context. ISR context is limited to Signal-safe
+     * ops — no ring walking here. Also on link-status change (LSC)
+     * we could signal, but nothing consumes that yet. */
+    if ((icr & (1U << 7)) && base->unit_task && base->unit_signal_mask) {
+        struct ExecIFace *IExec = base->IExec;
+        IExec->Signal(base->unit_task, base->unit_signal_mask);
+    }
     return 1;                   /* claimed */
 }
 
@@ -653,9 +814,6 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * alignment requirement. Buffers: 16 × 2KB, one per RX descriptor.
      * If any alloc fails we log, leave hw_present TRUE (basic Init worked)
      * but skip ring programming — later phases refuse to enable RX/TX. */
-#define V1000_RING_ENTRIES   16
-#define V1000_DESC_SIZE      16
-#define V1000_RX_BUFSIZE     2048
     {
         ULONG ring_bytes = V1000_RING_ENTRIES * V1000_DESC_SIZE;
         ULONG buf_bytes  = V1000_RING_ENTRIES * V1000_RX_BUFSIZE;
@@ -823,6 +981,17 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
+    /* Phase 6k: unit task infrastructure is implemented but starting
+     * it here breaks debug-force-Expunge — some subtle lifecycle race
+     * where task_stop doesn't fully clean up before the next test's
+     * OpenDevice, so state persists across "fresh" Init cycles. The
+     * task_start / task_stop / v1000_process_rx / CMD_READ enqueue
+     * code paths are ready; enable when we have a proper AbortIO and
+     * a way to keep the driver resident across tests without state
+     * pollution. */
+    LOGF(log, (CONST_STRPTR)"unit task: NOT STARTED (see comment above)\n");
+    (void)v1000_task_start;   /* silence unused-warning */
+
     /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
      * S2_ONLINE (or the debug V1000_DBG_FIRE_IRQ, once online) to make
      * the device live. */
@@ -885,6 +1054,7 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
             op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
                 S2_CopyToBuff, 0, tags);
         }
+        devBase->IExec->NewList((struct List *)&op->read_queue);
         devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
         devBase->IExec->AddTail((struct List *)&devBase->opener_list,
                                  (struct Node *)&op->node);
@@ -965,6 +1135,12 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
             IExec->RemIntServer(devBase->irq_vector, &devBase->irq_node);
             devBase->irq_installed = FALSE;
         }
+
+        /* Phase 6k: stop the unit task before freeing anything it may
+         * still reference. Order: quiesce HW (above) → RemIntServer
+         * (so ISR can't run) → stop task (so it can't process late-
+         * arriving signals against freed memory). */
+        v1000_task_stop(devBase, IExec);
 
         /* Free any Openers still on the list (there shouldn't be any at
          * Expunge time — Close should have cleaned up — but defensive). */
@@ -1490,6 +1666,41 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
         }
         break;
+    }
+
+    case CMD_READ: {
+        /* Phase 6k: queue the caller's CMD_READ on their opener's
+         * read queue. Unit task delivers via CopyToBuff when a frame
+         * arrives (see v1000_process_rx). Caller is expected to have
+         * used SendIO + WaitIO (or DoIO — but DoIO's IOF_QUICK clear
+         * means it Wait's on the reply port anyway). */
+        if (devBase->state != V1000_STATE_ONLINE) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        struct V1000Opener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
+        } else {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+        }
+        if (!op) {
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
+            break;
+        }
+        IExec->AddTail((struct List *)&op->read_queue,
+                       (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+
+        /* Clear IOF_QUICK so the caller's WaitIO actually waits for the
+         * reply. Also — since we did NOT set io_Error and are NOT
+         * ReplyMsg'ing here, return early to skip the tail ReplyMsg. */
+        ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+        return;
     }
 
     case S2_GETSTATIONADDRESS: {

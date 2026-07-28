@@ -116,6 +116,18 @@ struct Virte1000Base
     struct UtilityIFace *IUtility;
     struct MinList      opener_list;
     struct SignalSemaphore opener_lock;
+
+    /* Phase 6k: driver task that processes queued CMD_READ requests
+     * when the ISR signals a new RX frame. task_shutdown = TRUE tells
+     * the task to exit; ISR signals unit_task with unit_signal_mask
+     * on RXT0. Startup handshake uses parent_task/parent_mask so Init
+     * can wait until the task is ready before returning to caller. */
+    struct Task        *unit_task;
+    ULONG               unit_signal_mask;   /* filled by task itself */
+    volatile BOOL       task_shutdown;
+    volatile BOOL       task_ready_ok;      /* task sets on successful start */
+    struct Task        *parent_task;        /* startup handshake target */
+    ULONG               parent_ready_mask;
 };
 
 /* Per-opener state — one entry per OpenDevice() call. Stashes the
@@ -132,6 +144,11 @@ struct V1000Opener
      * (e.g. RAW-only clients like testtx). */
     APTR            copy_from_buff;
     APTR            copy_to_buff;
+
+    /* Phase 6k: queue of CMD_READ requests waiting for a frame.
+     * BeginIO enqueues, unit task dequeues + delivers via CopyToBuff.
+     * IORequest's io_Message.mn_Node fits as-is on this list. */
+    struct MinList  read_queue;
 };
 
 /* Unit-state values held in Virte1000Base.state. Defined as constants
