@@ -187,6 +187,16 @@ static const UWORD v1000_supported_cmds[] = {
     S2_READORPHAN,
     S2_ONEVENT,
     S2_GETGLOBALSTATS,
+    /* Phase 7a: advertise the commands Roadshow issues at bind time
+     * even though we treat them as no-ops. Roadshow's DHCP failure with
+     * "broadcast access not supported" is likely because it calls
+     * S2_ADDMULTICASTADDRESSES(broadcast MAC) and gets IOERR_NOCMD. */
+    S2_TRACKTYPE,
+    S2_UNTRACKTYPE,
+    S2_ADDMULTICASTADDRESS,
+    S2_DELMULTICASTADDRESS,
+    S2_ADDMULTICASTADDRESSES,
+    S2_DELMULTICASTADDRESSES,
     0
 };
 
@@ -1695,6 +1705,11 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
+    case S2_READORPHAN:
+        /* Frames not claimed by any type-tracked opener. We don't do
+         * per-type filtering, so orphan reads are structurally
+         * identical to CMD_READ — fall through. */
+        /* fallthrough */
     case CMD_READ: {
         /* Phase 6k: queue the caller's CMD_READ on their opener's
          * read queue. Unit task delivers via CopyToBuff when a frame
@@ -1743,6 +1758,61 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         for (int i = 0; i < 6; i++) {
             ioreq->ios2_SrcAddr[i] = devBase->mac[i];
             ioreq->ios2_DstAddr[i] = devBase->mac[i];
+        }
+        break;
+    }
+
+    /* Phase 7a: Roadshow-required no-op handlers. Advertising these in
+     * v1000_supported_cmds without a handler makes Roadshow's DHCP fail
+     * with "broadcast access not supported". Returning success (0) is
+     * fine because our RCTL already accepts broadcast (BAM) and all
+     * multicast (MPE), so subscription requests are effectively already
+     * honored at the HW level — no per-address filter table to update. */
+    case S2_ADDMULTICASTADDRESS:
+    case S2_DELMULTICASTADDRESS:
+    case S2_ADDMULTICASTADDRESSES:
+    case S2_DELMULTICASTADDRESSES:
+        /* Success. HW is already accepting broadcast + all multicast. */
+        break;
+
+    case S2_TRACKTYPE:
+    case S2_UNTRACKTYPE:
+        /* Optional per-ethertype packet-count tracking. We don't keep
+         * per-type counters yet; report success so Roadshow (which
+         * tracks 0x0800/0x0806/0x86DD at bind time) proceeds. */
+        break;
+
+    case S2_ONEVENT: {
+        /* SANA-II event notification. Real drivers queue the request
+         * and reply when a subscribed event fires (S2EVENT_ONLINE etc).
+         * Phase 7a: if the caller is subscribing to an event whose
+         * current state is already true, reply immediately with the
+         * event mask; otherwise reply with success but empty mask.
+         * This is enough for Roadshow to proceed — it subscribes to
+         * S2EVENT_ONLINE at bind time, and we're ONLINE by then. */
+        ULONG mask = ioreq->ios2_WireError;   /* caller-supplied event mask */
+        ULONG match = 0;
+        if ((mask & S2EVENT_ONLINE)  && devBase->state == V1000_STATE_ONLINE)  match |= S2EVENT_ONLINE;
+        if ((mask & S2EVENT_OFFLINE) && devBase->state != V1000_STATE_ONLINE)  match |= S2EVENT_OFFLINE;
+        ioreq->ios2_WireError = match ? match : mask;
+        /* io_Error stays 0 — event either matched or the caller can
+         * inspect WireError. Not queuing yet; Roadshow tolerates this
+         * pattern in existing drivers (rtl8139.device, etc). */
+        break;
+    }
+
+    case S2_GETGLOBALSTATS: {
+        /* Fill Sana2DeviceStats with zeros — we don't yet maintain
+         * per-driver counters. Roadshow uses this for stats display
+         * only; returning zeros is safer than IOERR_NOCMD. */
+        struct Sana2DeviceStats *st = (struct Sana2DeviceStats *)ioreq->ios2_StatData;
+        if (!st) st = (struct Sana2DeviceStats *)ioreq->ios2_Data;
+        if (st) {
+            /* volatile stops GCC optimizing the loop into memset() —
+             * memset would pull newlib into a resident driver and fail
+             * to link. Same trick as the TX zero-pad in CMD_WRITE. */
+            volatile UBYTE *p = (volatile UBYTE *)st;
+            for (ULONG i = 0; i < sizeof(struct Sana2DeviceStats); i++) p[i] = 0;
         }
         break;
     }
