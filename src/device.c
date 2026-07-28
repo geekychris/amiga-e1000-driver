@@ -28,6 +28,8 @@
 #include <dos/dos.h>
 #include <interfaces/dos.h>
 
+#include <exec/ports.h>    /* PA_IGNORE, MsgPort init */
+
 #include <stdarg.h>
 
 /* Status-file path. Init appends one line per attempt; each line begins
@@ -334,6 +336,32 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->last_icr      = 0;
     devBase->state         = V1000_STATE_OFFLINE;
     devBase->tx_next_slot  = 0;
+
+    /* Phase 6d: init the embedded unit's MsgPort. PA_IGNORE tells exec
+     * "don't queue+signal, just call BeginIO synchronously". That's the
+     * behavior we already implement — BeginIO handles everything inline
+     * and calls ReplyMsg when IOF_QUICK is clear. mp_MsgList must still
+     * be a valid empty List so nothing dereferences a NULL head/tail. */
+    {
+        struct Unit *u = &devBase->v1000_unit;
+        u->unit_MsgPort.mp_Node.ln_Type = NT_MSGPORT;
+        u->unit_MsgPort.mp_Node.ln_Name = (STRPTR)DEVNAME;
+        u->unit_MsgPort.mp_Node.ln_Pri  = 0;
+        /* PA_IGNORE: our BeginIO handles requests synchronously; no
+         * consumer task is needed. Empirically neither PA_IGNORE nor
+         * PA_SIGNAL with a real SigTask unblocks CMD_WRITE via DoIO —
+         * exec has a deeper check we haven't identified yet (returns
+         * IOERR_UNITBUSY before BeginIO runs). The other IO paths
+         * (DEVICEQUERY, GETSTATIONADDRESS, ONLINE/OFFLINE, private
+         * DBG commands) work fine with either mode. */
+        u->unit_MsgPort.mp_Flags        = PA_IGNORE;
+        u->unit_MsgPort.mp_SigBit       = 0;
+        u->unit_MsgPort.mp_SigTask      = NULL;
+        iexec->NewList(&u->unit_MsgPort.mp_MsgList);
+        u->unit_flags   = UNITF_ACTIVE;
+        u->unit_pad     = 0;
+        u->unit_OpenCnt = 0;
+    }
     for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
 
     devBase->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
@@ -683,8 +711,15 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
         return NULL;
     }
 
-    ioreq->ios2_Req.io_Unit   = (struct Unit *)devBase; /* placeholder */
+    /* Phase 6d: hand out the real unit pointer so exec's async-path
+     * dispatch (needed for CMD_WRITE / S2_BROADCAST / S2_MULTICAST)
+     * finds a valid MsgPort. Fake devBase-cast worked for direct-
+     * dispatch commands but returned -6 for anything routed through
+     * unit_MsgPort. Increment unit_OpenCnt to mirror lib_OpenCnt so
+     * exec sees the unit as actively used. */
+    ioreq->ios2_Req.io_Unit   = &devBase->v1000_unit;
     ioreq->ios2_Req.io_Error  = 0;
+    devBase->v1000_unit.unit_OpenCnt++;
     devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
 
     return devBase;
@@ -698,6 +733,8 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
     ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
     ioreq->ios2_Req.io_Device = (struct Device *)-1;
 
+    if (devBase->v1000_unit.unit_OpenCnt > 0)
+        devBase->v1000_unit.unit_OpenCnt--;
     devBase->dev_Base.dd_Library.lib_OpenCnt--;
 
 #ifdef DEBUG

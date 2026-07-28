@@ -78,6 +78,15 @@ struct Virte1000Base
      * need to be a full ring — but keeping it as a slot index gets the
      * bookkeeping right for the future async version. */
     ULONG            tx_next_slot;
+
+    /* Phase 6d: real struct Unit so OS4 exec can enqueue IORequests
+     * for async-path commands (CMD_WRITE, S2_BROADCAST, S2_MULTICAST).
+     * Embedded (not a pointer) so lifetime tracks Virte1000Base and no
+     * separate alloc/free is needed. Init sets up unit_MsgPort with
+     * PA_IGNORE so exec bypasses the signal path and calls BeginIO
+     * synchronously — same net effect as the old fake io_Unit but with
+     * a valid MsgPort structure. Single unit only (unit 0). */
+    struct Unit      v1000_unit;
 };
 
 /* Unit-state values held in Virte1000Base.state. Defined as constants

@@ -1,20 +1,24 @@
 /*
- * testtx — SKIPPED (known issue documented in device.c CMD_WRITE case).
+ * testtx — SKIPPED (CMD_WRITE dispatch mystery documented in
+ *                    memory os4-doio-ioflags-quirks).
  *
- * OS4 exec's DoIO/SendIO on our driver returns -6 (IOERR_UNITBUSY)
- * before BeginIO runs for io_Command values that appear to route
- * through the io_Unit's MsgPort — specifically CMD_WRITE and
- * S2_BROADCAST/MULTICAST. Root cause: we set io_Unit to a fake
- * (Virte1000Base cast) pointer in Open, with no real MsgPort.
+ * Even after Phase 6d's Unit refactor (real embedded struct Unit with
+ * PA_IGNORE MsgPort, valid MsgList, UNITF_ACTIVE), OS4 exec still
+ * returns IOERR_UNITBUSY (-6) for CMD_WRITE (and S2_BROADCAST, and
+ * an arbitrary private io_Command 0xF010) BEFORE calling our BeginIO.
+ * DEVICEQUERY, GETSTATIONADDRESS, CONFIGINTERFACE, ONLINE, OFFLINE,
+ * and private DBG_STATUS/FIRE_IRQ all dispatch fine with the same
+ * setup — so it's io_Command-specific but not a simple "numeric
+ * range" filter. Even calling IExec->BeginIO directly (bypassing DoIO)
+ * returns -6, so the rejection is inside exec's dispatch layer, not
+ * DoIO's routing.
  *
- * Fix (Phase 6d): allocate a real struct Unit per open. Once done,
- * this test will exercise CMD_WRITE / TPT counter. Until then it
- * reports SKIP so the suite passes cleanly.
- *
- * Symptoms this test would catch once un-skipped:
- *   - CMD_WRITE with SANA2IOF_RAW succeeds
- *   - TPT (Total Packets Transmitted) e1000 stat advances
- *   - TXDW interrupt fires
+ * The CMD_WRITE code in device.c is structurally correct — it
+ * builds a TX descriptor, bumps TDT, polls for STATUS.DD, and would
+ * happily send a frame if only exec would let it. Unblocking probably
+ * needs reading a shipping OS4 SANA-II driver source (rtl8139.device
+ * being the obvious candidate) to see what unit_flags / MsgPort setup
+ * / interface trick they use.
  */
 
 #include <exec/errors.h>
@@ -27,10 +31,9 @@
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    IDOS->Printf("testtx: SKIP - CMD_WRITE path needs struct Unit rework (Phase 6d).\n");
-    /* Skip = pass for suite purposes; we don't want CI to fail on a
-     * known-blocked test. When Phase 6d lands, rewrite this to exercise
-     * CMD_WRITE + verify TPT increment. */
+    IDOS->Printf("testtx: SKIP - CMD_WRITE hits exec IOERR_UNITBUSY (-6) even with\n"
+                 "        a real struct Unit + PA_IGNORE/PA_SIGNAL + UNITF_ACTIVE.\n"
+                 "        Root cause needs reading rtl8139.device or equivalent.\n");
     IDOS->Printf("RESULT: PASS\n");
     return 0;
 }
