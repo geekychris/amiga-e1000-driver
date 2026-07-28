@@ -413,6 +413,8 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->rx_ring_phys  = 0;
     devBase->tx_ring_phys  = 0;
     devBase->rx_buffers_phys = 0;
+    devBase->tx_scratch    = NULL;
+    devBase->tx_scratch_phys = 0;
     devBase->irq_vector    = 0;
     devBase->irq_installed = FALSE;
     devBase->irq_counter   = 0;
@@ -709,6 +711,23 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         LOGF(log, (CONST_STRPTR)"rings phys: rx_ring=%08lx tx_ring=%08lx rx_buffers=%08lx\n",
              (ULONG)devBase->rx_ring_phys, (ULONG)devBase->tx_ring_phys,
              (ULONG)devBase->rx_buffers_phys);
+
+        /* Dedicated TX scratch — separate from rx_buffers so HW's
+         * TX-read DMA doesn't race with RX-write DMA at the same phys
+         * address. 2 KB is enough for one full-size Ethernet frame. */
+        devBase->tx_scratch = iexec->AllocVecTags(V1000_RX_BUFSIZE,
+            AVT_Type,           MEMF_SHARED,
+            AVT_Contiguous,     TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,      16,
+            AVT_ClearWithValue, 0,
+            TAG_END);
+        if (devBase->tx_scratch) {
+            devBase->tx_scratch_phys = v1000_dma_phys(iexec, devBase->tx_scratch,
+                                                      V1000_RX_BUFSIZE, DMA_ReadFromRAM);
+        }
+        LOGF(log, (CONST_STRPTR)"tx_scratch: cpu=%p phys=%08lx\n",
+             devBase->tx_scratch, (ULONG)devBase->tx_scratch_phys);
     }
 
     /* -------- Phase 4c: populate RX descriptors + program RX ring regs ----
@@ -959,6 +978,7 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
             IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
 
+        if (devBase->tx_scratch) { IExec->FreeVec(devBase->tx_scratch); devBase->tx_scratch = NULL; }
         if (devBase->rx_buffers) { IExec->FreeVec(devBase->rx_buffers); devBase->rx_buffers = NULL; }
         if (devBase->tx_ring)    { IExec->FreeVec(devBase->tx_ring);    devBase->tx_ring    = NULL; }
         if (devBase->rx_ring)    { IExec->FreeVec(devBase->rx_ring);    devBase->rx_ring    = NULL; }
@@ -1096,6 +1116,88 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         r->DeviceSubType     = 0;
         r->SupportedCommands = (UWORD *)v1000_supported_cmds;
         sreq->io_Actual      = want;
+        break;
+    }
+
+    case V1000_DBG_RECV: {
+        /* Phase 6j-3: reap one RX descriptor and deliver via the
+         * caller's CopyToBuff hook.
+         *
+         * Contract:
+         *   IN:  ios2_Data           = target cookie (opaque, passed to
+         *                              CopyToBuff as schm_To)
+         *        ios2_BufferManagement = same as at Open (opener lookup)
+         *   OUT: ios2_DataLength     = frame length (payload after 14-byte
+         *                              Ethernet header stripped)
+         *        ios2_PacketType     = ethertype from the frame
+         *        ios2_SrcAddr[0..5]  = source MAC from the frame
+         *        io_Error            = 0 on success, IOERR_UNITBUSY if
+         *                              no DD-set descriptor
+         *
+         * Simplification: only walks slot 0 for this first cut. Real
+         * driver needs rx_next_clean tracking + RDT refill. */
+        if (devBase->state != V1000_STATE_ONLINE || !devBase->rx_ring) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        volatile UBYTE *rr = (volatile UBYTE *)devBase->rx_ring;
+        volatile UBYTE *rd = rr + (0 * V1000_DESC_SIZE);  /* slot 0 */
+        if (!(rd[12] & 0x01)) {
+            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
+            break;
+        }
+        /* Length in bytes 8-9 (LE). */
+        ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
+        if (frame_len < 14 || frame_len > V1000_RX_BUFSIZE) {
+            /* Malformed length — clear descriptor + refuse. */
+            rd[12] = 0;
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            break;
+        }
+        UBYTE *rxbuf = (UBYTE *)devBase->rx_buffers + (0 * V1000_RX_BUFSIZE);
+
+        /* Fill SrcAddr from the frame (bytes 6..11). Ethertype = 12..13. */
+        for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
+        ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+        ULONG payload_len = frame_len - 14;
+
+        /* Try cooked delivery via CopyToBuff hook. If we have an
+         * opener with a hook + IUtility, invoke it with schm_To =
+         * caller's cookie (ios2_Data), schm_From = payload start
+         * (after Ethernet header). */
+        struct V1000Opener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+        if (op && op->copy_to_buff && devBase->IUtility && ioreq->ios2_Data) {
+            struct SANA2CopyHookMsg msg;
+            msg.schm_Method  = S2_CopyToBuff;
+            msg.schm_MsgSize = sizeof(msg);
+            msg.schm_To      = ioreq->ios2_Data;
+            msg.schm_From    = rxbuf + 14;      /* payload after Ethernet header */
+            msg.schm_Size    = payload_len;
+            BOOL ok = (BOOL)(ULONG)devBase->IUtility->CallHookPkt(
+                (struct Hook *)op->copy_to_buff, ioreq, &msg);
+            if (!ok) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                /* fall through — clear descriptor either way */
+            }
+        }
+        /* If no hook installed, caller can inspect payload directly:
+         * we've populated ios2_PacketType / SrcAddr, and they know
+         * where their own buffer is. This is for testrx-style callers. */
+
+        ioreq->ios2_DataLength = payload_len;
+
+        /* Reset descriptor status so HW can reuse this slot on wrap.
+         * Clean would be: advance RDT to hand the slot back to HW.
+         * For the first-cut single-slot demo we just clear DD; the
+         * RDT stays where it is. Enough to prove the round-trip. */
+        rd[12] = 0;
         break;
     }
 
@@ -1270,17 +1372,17 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         }
         ioreq->ios2_WireError = 0x3000;
 
-        /* Two shapes:
-         *   COOKED — opener has copy_from_buff hook. ios2_Data is an
-         *            opaque cookie the caller understands; we build the
-         *            14-byte Ethernet header (dst | src=our MAC | type)
-         *            and pull payload via IUtility->CallHookPkt.
-         *   RAW    — no hook (or no matching opener). ios2_Data is a
-         *            fully-framed L2 packet; we memcpy it verbatim.
-         * The RAW path is what testtx / V1000_DBG_SEND uses; cooked is
-         * what Roadshow (or testtx_cooked) uses. */
-        ULONG slot = devBase->tx_next_slot;
-        UBYTE *dst = (UBYTE *)devBase->rx_buffers + (slot * V1000_RX_BUFSIZE);
+        /* Two shapes: COOKED (opener has hook) or RAW (memcpy).
+         * Use the dedicated tx_scratch buffer — NOT rx_buffers[slot],
+         * which is what the RX ring's descriptor also points at. Sharing
+         * caused HW TX-read to race with HW RX-write when a reply frame
+         * arrived during outbound send. */
+        if (!devBase->tx_scratch) {
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            break;
+        }
+        ULONG slot = devBase->tx_next_slot;         /* TX descriptor index */
+        UBYTE *dst = (UBYTE *)devBase->tx_scratch;  /* dedicated frame buf */
 
         struct V1000Opener *op = NULL;
         if (ioreq->ios2_BufferManagement) {
@@ -1314,20 +1416,24 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                 ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
                 break;
             }
-            /* Frame length now includes the Ethernet header. */
+            /* Frame length now includes the Ethernet header. Explicitly
+             * zero-pad to the 60-byte Ethernet minimum. Manual byte-at-a-
+             * time — a plain while-loop optimizes to memset() which pulls
+             * newlib into a resident driver and fails to link. */
             len = 14 + len;
-            if (len < 60) len = 60;  /* padding will be zero — dst was 0-init? not
-                                       * guaranteed; TCTL.PSP takes care of it on wire */
+            volatile UBYTE *pad = dst;   /* volatile stops the memset
+                                          * optimization */
+            for (ULONG i = len; i < 60; i++) pad[i] = 0;
+            if (len < 60) len = 60;
         } else {
             /* RAW: caller supplied full L2 frame in ios2_Data. */
             UBYTE *src = (UBYTE *)ioreq->ios2_Data;
             for (ULONG i = 0; i < len; i++) dst[i] = src[i];
         }
 
-        /* Physical addr of this slot's buffer. We could use the cached
-         * rx_buffers_phys + offset, but StartDMA at TX time also flushes
-         * the data cache for the frame bytes — critical since we just
-         * wrote them. Pair with EndDMA after we're sure HW is done. */
+        /* Physical addr of the TX scratch. StartDMA also flushes the
+         * data cache — critical since we just wrote the frame bytes.
+         * Pair with EndDMA after we're sure HW is done. */
         ULONG frame_len_io = len;
         uint32 buf_phys = v1000_dma_phys(IExec, dst, len, DMA_ReadFromRAM);
         if (!buf_phys) {

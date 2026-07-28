@@ -66,6 +66,12 @@ struct Virte1000Base
     ULONG   tx_ring_phys;
     ULONG   rx_buffers_phys;
 
+    /* Phase 6j-3: dedicated scratch buffer for CMD_WRITE. Sharing the
+     * RX buffer pool with TX caused DMA read/write races on the same
+     * address when an inbound frame arrived during outbound send. */
+    APTR    tx_scratch;
+    ULONG   tx_scratch_phys;
+
     /* Phase 5: PCI INTx interrupt handler. irq_installed guards Expunge
      * so we RemIntServer only if AddIntServer succeeded. irq_counter and
      * last_icr are updated by the ISR on every fire — read from user
@@ -144,5 +150,12 @@ struct V1000Opener
                                      * of ios2_DataLength bytes; workaround
                                      * for CMD_WRITE being blocked by
                                      * exec's dispatch layer */
+#define V1000_DBG_RECV     0xF004   /* Reap one RX frame from the ring.
+                                     * If opener has CopyToBuff hook,
+                                     * invoke it with schm_To = ios2_Data
+                                     * (caller's target cookie). Returns
+                                     * frame_len in ios2_DataLength on
+                                     * success; io_Error = IOERR_UNITBUSY
+                                     * if no frame ready. */
 
 #endif

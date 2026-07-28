@@ -20,9 +20,10 @@ if [[ -z "$TEST" ]]; then
 fi
 shift || true
 
-TIMEOUT=10
+TIMEOUT=20   # default gives testrx_cooked's poll loop (5 s wall-clock)
+             # + reply time + margin. Override with --timeout N.
 if [[ "${1:-}" == "--timeout" ]]; then
-  TIMEOUT="${2:-10}"; shift 2
+  TIMEOUT="${2:-20}"; shift 2
 fi
 
 OUT="RAM:${TEST}.out"
@@ -34,15 +35,19 @@ resp=$(curl -fs -X POST "$API/api/launch" -H 'Content-Type: application/json' \
   -d "{\"command\":\"DH1:$TEST >$OUT\"}")
 echo "launch: $resp" >&2
 
-# Poll until size stabilises (two consecutive reads agree) or timeout.
-prev_size=-1
+# Poll until file size stabilises (two consecutive reads agree) or
+# timeout. NOTE: devbench's /api/file returns `size` = bytes REMAINING
+# from the given offset, not total file size. To get total we read the
+# whole file (up to 4 KB probe) and measure hexData length. When two
+# consecutive polls return the same hex length, the test is done writing.
+prev_hex_len=-1
 elapsed=0
 while (( elapsed < TIMEOUT )); do
   sleep 1; elapsed=$((elapsed + 1))
-  info=$(curl -fs "$API/api/file?path=$OUT&offset=0&size=1") || continue
-  size=$(python3 -c "import sys, json; print(json.load(sys.stdin).get('size', -1))" <<<"$info")
-  if [[ "$size" -ge 0 && "$size" == "$prev_size" ]]; then break; fi
-  prev_size="$size"
+  info=$(curl -fs "$API/api/file?path=$OUT&offset=0&size=4096") || continue
+  hex_len=$(python3 -c "import sys, json; print(len(json.load(sys.stdin).get('hexData','')))" <<<"$info")
+  if [[ "$hex_len" -gt 0 && "$hex_len" == "$prev_hex_len" ]]; then break; fi
+  prev_hex_len="$hex_len"
 done
 
 body=$(curl -fs "$API/api/file?path=$OUT&offset=0&size=65536" \
