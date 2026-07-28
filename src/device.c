@@ -1369,7 +1369,13 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         q->DeviceLevel    = 0;
         q->AddrFieldSize  = 48;
         q->MTU            = 1500;
-        q->BPS            = 1000000000UL;
+        /* BPS: report 100 Mbps rather than 1 Gbps. QEMU's e1000 model
+         * always says "link UP full duplex 1000Mb" via STATUS, but
+         * Roadshow may pre-allocate scaled buffer pools based on BPS;
+         * 1G is a well-known ceiling that trips old TCP/IP stacks.
+         * 100Mbps is well-inside every stack's comfort zone and still
+         * accurate to what QEMU's user-mode NAT actually delivers. */
+        q->BPS            = 100000000UL;
         q->HardwareType   = S2WireType_Ethernet;
         q->RawMTU         = 1514;
         break;
