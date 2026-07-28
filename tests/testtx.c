@@ -119,20 +119,21 @@ out:
     IExec->FreeSysObject(ASOT_IOREQUEST, req);
     IExec->FreeSysObject(ASOT_PORT, port);
 
-    /* PASS = CMD_WRITE reached the driver's BeginIO.
-     *   rc == -6 && wire == 0x7000: our own IOERR_UNITBUSY timeout after
-     *                                dispatch — descriptor didn't complete
-     *                                but we DID get called. Big win.
-     *   rc ==  0                  : full success (TX-completion working)
-     *   any other -6              : exec REJECTED dispatch (old failure).
-     * Frame egress (TPT delta > 0) is separately a known TODO. */
-    BOOL dispatched = (cmdw_rc == -6 && cmdw_wire == 0x7000)
-                   || (cmdw_rc ==  0 && cmdw_ioerr == 0);
-    if (dispatched) {
-        IDOS->Printf("RESULT: PASS (CMD_WRITE dispatched; TX-completion TODO)\n");
+    /* PASS = CMD_WRITE dispatched cleanly AND HW actually sent a frame:
+     *   - DoIO returns 0
+     *   - io_Error clear
+     *   - TPT (Total Packets Transmitted, e1000 hardware stat) incremented
+     *     by exactly 1 (proves the frame reached the wire in QEMU) */
+    BOOL sent = (cmdw_rc == 0)
+             && (cmdw_ioerr == 0)
+             && (tpt_after == tpt_before + 1);
+    if (sent) {
+        IDOS->Printf("RESULT: PASS (frame egressed, TPT +1)\n");
     } else {
-        IDOS->Printf("RESULT: FAIL CMD_WRITE dispatch blocked rc=%ld wire=0x%lx\n",
-                     (long)cmdw_rc, (unsigned long)cmdw_wire);
+        IDOS->Printf("RESULT: FAIL rc=%ld ioerr=%ld wire=0x%lx tpt=%lu->%lu\n",
+                     (long)cmdw_rc, (long)cmdw_ioerr,
+                     (unsigned long)cmdw_wire,
+                     (unsigned long)tpt_before, (unsigned long)tpt_after);
     }
-    return dispatched ? 0 : 20;
+    return sent ? 0 : 20;
 }

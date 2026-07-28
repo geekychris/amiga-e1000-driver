@@ -231,6 +231,43 @@ static inline void poke_le32(volatile void *p, uint32 v)
     __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "r"(p) : "memory");
 }
 
+/* Full memory barrier — ensures all prior stores complete before any
+ * subsequent memory ops. Required after building a descriptor and
+ * before writing the doorbell (TDT) so HW sees a consistent descriptor.
+ * pa6t_eth calls this pasemi_wmb; same instruction. */
+static inline void v1000_wmb(void)
+{
+    __asm__ volatile ("sync" : : : "memory");
+}
+
+/* Resolve a CPU-virtual allocation to its PCI-bus physical address
+ * via the OS4-blessed StartDMA + GetDMAList path (pa6t_eth pattern).
+ * Returns 0 on failure. Caller should have kept the allocation in the
+ * DMA state via StartDMA — this function releases via EndDMA before
+ * returning, which is fine for one-shot alloc-and-forget or when
+ * we're doing StartDMA per operation. For the driver's long-lived
+ * ring memory we keep the mapping alive until Expunge (see Init). */
+static uint32 v1000_dma_phys(struct ExecIFace *IExec, void *virt,
+                             uint32 size, uint32 flags)
+{
+    uint32 nentries = IExec->StartDMA(virt, size, flags);
+    if (nentries == 0) return 0;
+    struct DMAEntry *dlist = (struct DMAEntry *)IExec->AllocSysObjectTags(
+        ASOT_DMAENTRY, ASODMAE_NumEntries, nentries, TAG_DONE);
+    if (!dlist) {
+        IExec->EndDMA(virt, size, flags | DMAF_NoModify);
+        return 0;
+    }
+    IExec->GetDMAList(virt, size, flags, dlist);
+    uint32 phys = (uint32)dlist[0].PhysicalAddress;
+    if (nentries > 1) {
+        IExec->DebugPrintF("[virte1000] dma_phys: WARNING non-contiguous virt=%p size=%lu nentries=%lu\n",
+                           virt, size, nentries);
+    }
+    IExec->FreeSysObject(ASOT_DMAENTRY, dlist);
+    return phys;
+}
+
 /* Forward decl — real definitions live further down with the other MMIO
  * helpers. The ISR below needs to call e1000_read32(ICR). */
 static inline uint32 e1000_read32(volatile void *base, uint32 off);
@@ -358,6 +395,9 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->rx_ring       = NULL;
     devBase->tx_ring       = NULL;
     devBase->rx_buffers    = NULL;
+    devBase->rx_ring_phys  = 0;
+    devBase->tx_ring_phys  = 0;
+    devBase->rx_buffers_phys = 0;
     devBase->irq_vector    = 0;
     devBase->irq_installed = FALSE;
     devBase->irq_counter   = 0;
@@ -616,6 +656,28 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         if (!devBase->rx_ring || !devBase->tx_ring || !devBase->rx_buffers) {
             LOGF(log, (CONST_STRPTR)"rings: ALLOC FAILED - device will not be enabled\n");
         }
+
+        /* Resolve CPU-virtual ring addresses to PCI-bus physical
+         * addresses via StartDMA + GetDMAList. These physical values
+         * are what we write to RDBAL/TDBAL and per-descriptor
+         * buffer_addr fields. On sam460ex they often match the CPU
+         * virt (identity mapping) but we can't rely on that — the
+         * pa6t_eth reference driver does this per-allocation. */
+        if (devBase->rx_ring) {
+            devBase->rx_ring_phys = v1000_dma_phys(iexec, devBase->rx_ring,
+                                                    ring_bytes, 0);
+        }
+        if (devBase->tx_ring) {
+            devBase->tx_ring_phys = v1000_dma_phys(iexec, devBase->tx_ring,
+                                                    ring_bytes, DMA_ReadFromRAM);
+        }
+        if (devBase->rx_buffers) {
+            devBase->rx_buffers_phys = v1000_dma_phys(iexec, devBase->rx_buffers,
+                                                       buf_bytes, 0);
+        }
+        LOGF(log, (CONST_STRPTR)"rings phys: rx_ring=%08lx tx_ring=%08lx rx_buffers=%08lx\n",
+             (ULONG)devBase->rx_ring_phys, (ULONG)devBase->tx_ring_phys,
+             (ULONG)devBase->rx_buffers_phys);
     }
 
     /* -------- Phase 4c: populate RX descriptors + program RX ring regs ----
@@ -629,9 +691,9 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * For "empty, ready to receive": buffer_addr = per-descriptor slice
      * of rx_buffers, everything else zero. RX is NOT enabled here — that's
      * Phase 4e. We only want to verify the register writes take. */
-    if (devBase->rx_ring && devBase->rx_buffers) {
+    if (devBase->rx_ring && devBase->rx_buffers && devBase->rx_buffers_phys) {
         volatile UBYTE *desc = (volatile UBYTE *)devBase->rx_ring;
-        ULONG buf_lo = (ULONG)devBase->rx_buffers;
+        ULONG buf_lo = devBase->rx_buffers_phys;   /* PCI-bus phys */
         for (int i = 0; i < V1000_RING_ENTRIES; i++) {
             volatile UBYTE *d = desc + (i * V1000_DESC_SIZE);
             poke_le32(d + 0, buf_lo + (i * V1000_RX_BUFSIZE));  /* addr low  */
@@ -639,9 +701,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
             poke_le32(d + 8, 0);                                 /* len+csum  */
             poke_le32(d + 12, 0);                                /* status/err/special */
         }
+        v1000_wmb();
 
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_RDBAL, (uint32)(ULONG)devBase->rx_ring);
+        e1000_write32(mmio, E1000_REG_RDBAL, devBase->rx_ring_phys);
         e1000_write32(mmio, E1000_REG_RDBAH, 0);
         e1000_write32(mmio, E1000_REG_RDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
         e1000_write32(mmio, E1000_REG_RDH,   0);
@@ -662,9 +725,9 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * the ring memory as-is (zeros). Just program the base/length so the
      * NIC knows where to look, and set HEAD=TAIL=0 for "no work queued".
      * TX still disabled (TCTL.EN=0). */
-    if (devBase->tx_ring) {
+    if (devBase->tx_ring && devBase->tx_ring_phys) {
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_TDBAL, (uint32)(ULONG)devBase->tx_ring);
+        e1000_write32(mmio, E1000_REG_TDBAL, devBase->tx_ring_phys);
         e1000_write32(mmio, E1000_REG_TDBAH, 0);
         e1000_write32(mmio, E1000_REG_TDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
         e1000_write32(mmio, E1000_REG_TDH,   0);
@@ -1077,47 +1140,58 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
             break;
         }
-        ioreq->ios2_WireError = 0x3000;   /* passed len check */
+        ioreq->ios2_WireError = 0x3000;
 
-        /* Copy caller's frame into the RX buffer pool. */
+        /* Copy caller's frame into the shared RX buffer pool at
+         * tx_next_slot. Then get its PCI-bus physical address via
+         * StartDMA — that's what goes into the descriptor. Using
+         * CPU virt (as we did before) meant QEMU's e1000 DMA'd from
+         * the wrong location, TDH advanced, but no packet actually
+         * shipped (TPT stayed 0). */
         ULONG slot = devBase->tx_next_slot;
         UBYTE *dst = (UBYTE *)devBase->rx_buffers + (slot * V1000_RX_BUFSIZE);
         UBYTE *src = (UBYTE *)ioreq->ios2_Data;
         for (ULONG i = 0; i < len; i++) dst[i] = src[i];
 
-        /* Build descriptor at tx_ring[slot]. All 16 bytes LE.
-         * On sam460ex the MMU is either off or identity-mapping RAM
-         * for our purposes, so CPU-virtual dst also serves as the
-         * PCI-bus address — no CachePreDMA translation needed. */
+        /* Physical addr of this slot's buffer. We could use the cached
+         * rx_buffers_phys + offset, but StartDMA at TX time also flushes
+         * the data cache for the frame bytes — critical since we just
+         * wrote them. Pair with EndDMA after we're sure HW is done. */
+        ULONG frame_len_io = len;
+        uint32 buf_phys = v1000_dma_phys(IExec, dst, len, DMA_ReadFromRAM);
+        if (!buf_phys) {
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            break;
+        }
+
+        /* Build descriptor at tx_ring[slot]. buffer_addr = PHYSICAL. */
         volatile UBYTE *d = (volatile UBYTE *)devBase->tx_ring + (slot * V1000_DESC_SIZE);
-        poke_le32(d +  0, (uint32)(ULONG)dst);
+        poke_le32(d +  0, buf_phys);
         poke_le32(d +  4, 0);
         poke_le32(d +  8, (uint32)len
                           | ((uint32)(E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS
                                       | E1000_TXD_CMD_RS) << 24));
         poke_le32(d + 12, 0);
 
-        /* Flush data cache for the frame + descriptor so DMA sees our
-         * writes. CacheClearE with CACRF_ClearD (bit 0) does a range
-         * flush without the CachePreDMA overhead that was hanging us. */
-        IExec->CacheClearE(dst, len, 1 /* CACRF_ClearD */);
-        IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, 1);
+        /* Full memory barrier — ensures descriptor writes hit RAM before
+         * the doorbell tells HW to start reading. pa6t_eth does the same. */
+        v1000_wmb();
 
-        /* Bump TDT — TX doorbell. HW starts pulling. */
+        /* Bump TDT — TX doorbell. HW pulls the descriptor + frame. */
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
         ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
         e1000_write32(mmio, E1000_REG_TDT, new_tdt);
         devBase->tx_next_slot = new_tdt;
 
-        /* Poll for STATUS.DD. Invalidate the descriptor's cache line
-         * each iteration via CacheClearE (bit 2 = CACRF_InvalidateD). */
+        /* Poll for STATUS.DD. HW writes it back via DMA. */
         BOOL done = FALSE;
-        for (int i = 0; i < 100; i++) {
-            IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, 4 /* CACRF_InvalidateD */);
+        for (int i = 0; i < 100000; i++) {
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
-            /* small busy delay between checks — no dos.library needed */
-            for (volatile int j = 0; j < 1000; j++) { __asm__ volatile ("" ::: "memory"); }
+            __asm__ volatile ("" : : : "memory");
         }
+
+        /* Release the DMA hold on the frame buffer. */
+        IExec->EndDMA(dst, frame_len_io, DMA_ReadFromRAM);
         /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
          * TCTL — so testtx can see what HW did. */
         uint32 tdh_now  = e1000_read32(mmio, E1000_REG_TDH);

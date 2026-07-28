@@ -49,9 +49,19 @@ struct Virte1000Base
      * (identity-mapped), so we hand these pointers directly to the NIC
      * as RDBAL/TDBAL values. NULL if ring alloc failed — subsequent
      * phases check and refuse to enable the device. */
-    APTR    rx_ring;      /* 16 × 16-byte descriptors */
-    APTR    tx_ring;      /* 16 × 16-byte descriptors */
-    APTR    rx_buffers;   /* 16 × 2KB pool; per-descriptor slices */
+    APTR    rx_ring;      /* 16 × 16-byte descriptors (CPU virt) */
+    APTR    tx_ring;      /* 16 × 16-byte descriptors (CPU virt) */
+    APTR    rx_buffers;   /* 16 × 2KB pool; per-descriptor slices (CPU virt) */
+
+    /* PCI-bus physical addresses of the above, obtained via
+     * IExec->StartDMA + GetDMAList. Written into RDBAL/TDBAL and
+     * per-descriptor buffer_addr fields. On sam460ex these usually
+     * equal the CPU virt addresses (identity map) but NOT reliably —
+     * pa6t_eth's approach (StartDMA per allocation) is the OS4-blessed
+     * path. */
+    ULONG   rx_ring_phys;
+    ULONG   tx_ring_phys;
+    ULONG   rx_buffers_phys;
 
     /* Phase 5: PCI INTx interrupt handler. irq_installed guards Expunge
      * so we RemIntServer only if AddIntServer succeeded. irq_counter and
