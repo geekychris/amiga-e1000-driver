@@ -1090,15 +1090,17 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
         devBase->IExec->DebugPrintF("[virte1000] Open: opener alloc failed\n");
         /* Continue anyway — testopen etc. don't rely on opener state. */
     } else {
-        /* SANA-II Rev 4: the caller passes a TAG LIST in
-         * ios2_BufferManagement at OpenDevice; the driver parses it,
-         * allocates per-opener state, and *replaces*
-         * ios2_BufferManagement with an opaque driver-side cookie
-         * that the caller carries back on every subsequent IORequest.
-         * The Rev 7 Roadshow client stops issuing IO if the driver
-         * doesn't do this rewrite — that was the "No buffer space
-         * available" AddNetInterface failure. Use our own opener
-         * pointer as the cookie so lookup is O(1) and unambiguous. */
+        /* Roadshow (observed empirically via cmdlog): treats
+         * ios2_BufferManagement as an INPUT-ONLY cookie. Roadshow
+         * saves the tag list pointer it passed at OpenDevice and
+         * re-sends that SAME pointer on every subsequent IORequest.
+         * It does NOT read back a driver-rewritten cookie. So we
+         * keep op->bm_cookie = the tag list pointer (matches what
+         * subsequent BeginIO calls pass) and DO NOT overwrite
+         * ios2_BufferManagement. An earlier version of this driver
+         * rewrote it to point at our V1000Opener, and every
+         * subsequent CMD_READ/S2_BROADCAST lookup failed because
+         * Roadshow kept sending its original tag list pointer. */
         struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
         if (tags && devBase->IUtility) {
             /* Roadshow can supply hook pointers for either the plain
@@ -1127,8 +1129,7 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
                 op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
                     S2_CopyToBuff16, 0, tags);
         }
-        op->bm_cookie = (APTR)op;   /* self-referential cookie */
-        ioreq->ios2_BufferManagement = (APTR)op;
+        op->bm_cookie = ioreq->ios2_BufferManagement;   /* the tag list */
         devBase->IExec->NewList((struct List *)&op->read_queue);
         devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
         devBase->IExec->AddTail((struct List *)&devBase->opener_list,
@@ -1363,7 +1364,15 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             break;
         }
         ULONG size_full = (ULONG)sizeof(struct Sana2DeviceQuery);
-        ULONG size_out  = (q->SizeAvailable < size_full) ? q->SizeAvailable : size_full;
+        /* Cap by whichever of q->SizeAvailable / ios2_DataLength is
+         * non-zero. Roadshow observed to pass len=24 in ios2_DataLength
+         * without setting q->SizeAvailable — our old code then wrote 0
+         * bytes (size_out = min(0, 32) = 0), and Roadshow read
+         * SizeSupplied=0 as "driver query failed". */
+        ULONG buf_size = q->SizeAvailable;
+        if (buf_size == 0) buf_size = ioreq->ios2_DataLength;
+        if (buf_size == 0) buf_size = size_full;   /* last-resort default */
+        ULONG size_out = (buf_size < size_full) ? buf_size : size_full;
         q->SizeSupplied  = size_out;
         q->DevQueryFormat = 0;
         q->DeviceLevel    = 0;
@@ -1554,25 +1563,57 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     }
 
     case V1000_DBG_CMDLOG: {
-        /* Dump the cmdlog ring into caller's buffer. Layout per entry
-         * (8 bytes): 2 cmd, 2 ioerr, 4 wire — 32 entries × 8 = 256 B.
-         * Returns the ring's head index (mod 32) so caller can walk in
-         * chronological order: (head - 32 + i) & 31. */
+        /* Dump the cmdlog ring into caller's buffer. 40 bytes/entry:
+         *   [0..1]  cmd
+         *   [2]     flags_in
+         *   [3]     (pad)
+         *   [4..5]  ioerr
+         *   [6..7]  ptype_in
+         *   [8..11] wire
+         *   [12..15] data_in ptr
+         *   [16..19] datalen_out
+         *   [20..23] bm_in ptr
+         *   [24..29] src_out (6)
+         *   [30..35] dst_out (6)
+         *   [36..39] (reserved)
+         * Total 32 × 40 = 1280 bytes.
+         * Returns the ring's head index in ios2_DataLength. */
         UBYTE *out = (UBYTE *)ioreq->ios2_Data;
-        if (out && ioreq->ios2_DataLength >= 32 * 8) {
+        if (out && ioreq->ios2_DataLength >= 32 * 40) {
             ULONG head = devBase->cmdlog_head;
             for (int i = 0; i < 32; i++) {
-                UBYTE *p = out + (i * 8);
-                p[0] = (UBYTE)(devBase->cmdlog[i].cmd >> 8);
-                p[1] = (UBYTE)(devBase->cmdlog[i].cmd);
-                p[2] = (UBYTE)(devBase->cmdlog[i].ioerr >> 8);
-                p[3] = (UBYTE)(devBase->cmdlog[i].ioerr);
-                p[4] = (UBYTE)(devBase->cmdlog[i].wire >> 24);
-                p[5] = (UBYTE)(devBase->cmdlog[i].wire >> 16);
-                p[6] = (UBYTE)(devBase->cmdlog[i].wire >> 8);
-                p[7] = (UBYTE)(devBase->cmdlog[i].wire);
+                UBYTE *p = out + (i * 40);
+                p[0]  = (UBYTE)(devBase->cmdlog[i].cmd >> 8);
+                p[1]  = (UBYTE)(devBase->cmdlog[i].cmd);
+                p[2]  = devBase->cmdlog[i].flags_in;
+                p[3]  = 0;
+                p[4]  = (UBYTE)(devBase->cmdlog[i].ioerr >> 8);
+                p[5]  = (UBYTE)(devBase->cmdlog[i].ioerr);
+                p[6]  = (UBYTE)(devBase->cmdlog[i].ptype_in >> 8);
+                p[7]  = (UBYTE)(devBase->cmdlog[i].ptype_in);
+                p[8]  = (UBYTE)(devBase->cmdlog[i].wire >> 24);
+                p[9]  = (UBYTE)(devBase->cmdlog[i].wire >> 16);
+                p[10] = (UBYTE)(devBase->cmdlog[i].wire >> 8);
+                p[11] = (UBYTE)(devBase->cmdlog[i].wire);
+                p[12] = (UBYTE)(devBase->cmdlog[i].data_in >> 24);
+                p[13] = (UBYTE)(devBase->cmdlog[i].data_in >> 16);
+                p[14] = (UBYTE)(devBase->cmdlog[i].data_in >> 8);
+                p[15] = (UBYTE)(devBase->cmdlog[i].data_in);
+                p[16] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 24);
+                p[17] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 16);
+                p[18] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 8);
+                p[19] = (UBYTE)(devBase->cmdlog[i].datalen_out);
+                p[20] = (UBYTE)(devBase->cmdlog[i].bm_in >> 24);
+                p[21] = (UBYTE)(devBase->cmdlog[i].bm_in >> 16);
+                p[22] = (UBYTE)(devBase->cmdlog[i].bm_in >> 8);
+                p[23] = (UBYTE)(devBase->cmdlog[i].bm_in);
+                for (int b = 0; b < 6; b++) {
+                    p[24 + b] = devBase->cmdlog[i].src_out[b];
+                    p[30 + b] = devBase->cmdlog[i].dst_out[b];
+                }
+                p[36] = p[37] = p[38] = p[39] = 0;
             }
-            ioreq->ios2_DataLength = head;   /* return head so caller can compute order */
+            ioreq->ios2_DataLength = head;
         }
         break;
     }
@@ -1982,9 +2023,18 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         && ioreq->ios2_Req.io_Command != V1000_DBG_STATUS
         && ioreq->ios2_Req.io_Command != V1000_DBG_DUMPTX) {
         ULONG i = devBase->cmdlog_head & 31;
-        devBase->cmdlog[i].cmd   = ioreq->ios2_Req.io_Command;
-        devBase->cmdlog[i].ioerr = ioreq->ios2_Req.io_Error;
-        devBase->cmdlog[i].wire  = ioreq->ios2_WireError;
+        devBase->cmdlog[i].cmd         = ioreq->ios2_Req.io_Command;
+        devBase->cmdlog[i].flags_in    = ioreq->ios2_Req.io_Flags;
+        devBase->cmdlog[i].ioerr       = ioreq->ios2_Req.io_Error;
+        devBase->cmdlog[i].wire        = ioreq->ios2_WireError;
+        devBase->cmdlog[i].data_in     = (ULONG)ioreq->ios2_Data;
+        devBase->cmdlog[i].bm_in       = (ULONG)ioreq->ios2_BufferManagement;
+        devBase->cmdlog[i].ptype_in    = (UWORD)ioreq->ios2_PacketType;
+        devBase->cmdlog[i].datalen_out = ioreq->ios2_DataLength;
+        for (int b = 0; b < 6; b++) {
+            devBase->cmdlog[i].src_out[b] = ioreq->ios2_SrcAddr[b];
+            devBase->cmdlog[i].dst_out[b] = ioreq->ios2_DstAddr[b];
+        }
         devBase->cmdlog_head++;
     }
 

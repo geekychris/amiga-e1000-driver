@@ -140,13 +140,20 @@ struct Virte1000Base
 
     /* Phase 7a diagnostic ring: last 32 BeginIO commands so a test can
      * see what Roadshow actually issued when a bind fails. Compact
-     * per-entry format so an entire snapshot fits in one 16-byte
-     * ios2_SrcAddr+DstAddr overlay. */
+     * per-entry format; V1000_DBG_CMDLOG dumps 32 x 40 bytes. */
     volatile ULONG      cmdlog_head;    /* next slot to write */
     struct {
-        UWORD  cmd;         /* io_Command */
-        WORD   ioerr;       /* io_Error we returned */
-        ULONG  wire;        /* WireError we returned */
+        UWORD  cmd;                 /* io_Command */
+        UBYTE  flags_in;            /* io_Flags on entry */
+        WORD   ioerr;               /* io_Error we returned */
+        ULONG  wire;                /* WireError we returned */
+        ULONG  data_in;             /* ios2_Data pointer on entry */
+        ULONG  datalen_in;          /* ios2_DataLength on entry */
+        ULONG  bm_in;               /* ios2_BufferManagement on entry */
+        UWORD  ptype_in;            /* ios2_PacketType on entry */
+        UBYTE  src_out[6];          /* ios2_SrcAddr we wrote back */
+        UBYTE  dst_out[6];          /* ios2_DstAddr we wrote back */
+        ULONG  datalen_out;         /* ios2_DataLength we returned */
     }                   cmdlog[32];
 };
 
