@@ -1,10 +1,11 @@
-# DEVS:NetInterfaces/virte1000
-# Roadshow config for virte1000.device on the OS4 sam460ex guest.
-# QEMU's user-mode NAT for n1 (e1000) runs 192.168.100.0/24; DHCP hands
-# out .15 by default. Gateway = 192.168.100.2.
-device=virte1000.device
-unit=0
-hardwaretype=Ethernet
-configure=dhcp
-id=virte1000
-mtu=1500
+DEVICE=DEVS:Networks/virte1000.device
+UNIT=0
+ADDRESS=192.168.100.15
+NETMASK=255.255.255.0
+MTU=1500
+ID=virte1000
+IPREQUESTS=1
+WRITEREQUESTS=1
+ARPREQUESTS=1
+MULTICAST=NO
+COPYMODE=SLOW

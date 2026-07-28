@@ -1101,10 +1101,31 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
          * pointer as the cookie so lookup is O(1) and unambiguous. */
         struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
         if (tags && devBase->IUtility) {
+            /* Roadshow can supply hook pointers for either the plain
+             * S2_CopyToBuff / S2_CopyFromBuff (byte-oriented) OR the
+             * 32-bit-aligned variants (S2_CopyToBuff32 etc). It always
+             * supplies AT LEAST ONE. We treat them all the same at the
+             * call site — CallHookPkt hands off a byte pointer, and
+             * Roadshow's hooks internally cope with either alignment.
+             * Falling back through the variants means we can bind to
+             * a Roadshow that only provides the 32/16-bit forms. */
             op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
                 S2_CopyFromBuff, 0, tags);
+            if (!op->copy_from_buff)
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff32, 0, tags);
+            if (!op->copy_from_buff)
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff16, 0, tags);
+
             op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
                 S2_CopyToBuff, 0, tags);
+            if (!op->copy_to_buff)
+                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyToBuff32, 0, tags);
+            if (!op->copy_to_buff)
+                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyToBuff16, 0, tags);
         }
         op->bm_cookie = (APTR)op;   /* self-referential cookie */
         ioreq->ios2_BufferManagement = (APTR)op;
@@ -1526,6 +1547,30 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
+    case V1000_DBG_CMDLOG: {
+        /* Dump the cmdlog ring into caller's buffer. Layout per entry
+         * (8 bytes): 2 cmd, 2 ioerr, 4 wire — 32 entries × 8 = 256 B.
+         * Returns the ring's head index (mod 32) so caller can walk in
+         * chronological order: (head - 32 + i) & 31. */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        if (out && ioreq->ios2_DataLength >= 32 * 8) {
+            ULONG head = devBase->cmdlog_head;
+            for (int i = 0; i < 32; i++) {
+                UBYTE *p = out + (i * 8);
+                p[0] = (UBYTE)(devBase->cmdlog[i].cmd >> 8);
+                p[1] = (UBYTE)(devBase->cmdlog[i].cmd);
+                p[2] = (UBYTE)(devBase->cmdlog[i].ioerr >> 8);
+                p[3] = (UBYTE)(devBase->cmdlog[i].ioerr);
+                p[4] = (UBYTE)(devBase->cmdlog[i].wire >> 24);
+                p[5] = (UBYTE)(devBase->cmdlog[i].wire >> 16);
+                p[6] = (UBYTE)(devBase->cmdlog[i].wire >> 8);
+                p[7] = (UBYTE)(devBase->cmdlog[i].wire);
+            }
+            ioreq->ios2_DataLength = head;   /* return head so caller can compute order */
+        }
+        break;
+    }
+
     case V1000_DBG_DUMPTX: {
         /* Dump first 16 bytes of the last-built cooked TX frame so callers
          * can eyeball the on-wire framing (Ethernet dst/src/etype + start
@@ -1556,20 +1601,45 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
 
     case S2_CONFIGINTERFACE: {
         /* SANA-II-NOTES §3.3: caller sets ios2_SrcAddr = MAC to program;
-         * all-zeros means "use factory". May be called ONCE — second call
-         * from any state returns BAD_STATE / IS_CONFIGURED. */
-        if (devBase->state != V1000_STATE_OFFLINE) {
-            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-            ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
-            break;
-        }
-        /* Detect all-zeros SrcAddr → keep factory MAC. Otherwise we'd
-         * write the caller-supplied MAC into RAL/RAH here; Phase 6a
-         * defers the actual re-program until we exercise it from a test
-         * (avoids touching hardware in the untested happy path). */
+         * all-zeros means "use factory".
+         *
+         * Phase 7a: Roadshow calls S2_CONFIGINTERFACE TWICE at bind time
+         * (once to probe, once to actually configure — cmdlog trace
+         * proved this). Under the strict "only from OFFLINE" reading of
+         * the spec, the second call returned S2ERR_BAD_STATE and made
+         * Roadshow report "No buffer space available" for the whole
+         * add. Real drivers (rtl8139.device etc.) accept the second call
+         * idempotently as long as no MAC change is requested. */
         BOOL want_factory = TRUE;
         for (int i = 0; i < 6; i++)
             if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
+
+        if (devBase->state != V1000_STATE_OFFLINE) {
+            /* Second (or later) config call — accept as no-op IF caller
+             * wants factory MAC (or the same MAC we already have). Refuse
+             * only actual MAC changes while online / already-configured. */
+            if (!want_factory) {
+                BOOL same_mac = TRUE;
+                for (int i = 0; i < 6; i++)
+                    if (ioreq->ios2_SrcAddr[i] != devBase->mac[i]) {
+                        same_mac = FALSE; break;
+                    }
+                if (!same_mac) {
+                    ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+                    ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
+                    break;
+                }
+            }
+            /* Same MAC (or factory) — success, no state change. Still
+             * fill in SrcAddr/DstAddr per SANA-II §3.3, since Roadshow
+             * reads these on every CONFIGINTERFACE reply, not just the
+             * first. */
+            for (int i = 0; i < 6; i++) {
+                ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+                ioreq->ios2_DstAddr[i] = 0xFF;
+            }
+            break;
+        }
         if (!want_factory) {
             /* TODO Phase 6b: program RAL/RAH from ios2_SrcAddr. For now
              * we accept the request and refuse to bounce the factory MAC,
@@ -1578,6 +1648,16 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
+        /* SANA-II §3.3 (fell through): on return, ios2_SrcAddr must
+         * hold the interface's hardware address (its own MAC) and
+         * ios2_DstAddr must hold the broadcast hardware address. This
+         * is how Roadshow discovers the device's broadcast MAC — if
+         * it's not set here, Roadshow doesn't know how to send to
+         * broadcast and quietly abandons config after this call. */
+        for (int i = 0; i < 6; i++) {
+            ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+            ioreq->ios2_DstAddr[i] = 0xFF;
+        }
         break;
     }
 
@@ -1887,6 +1967,19 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * them in one by one, following the same fail-soft pattern. */
         ioreq->ios2_Req.io_Error = IOERR_NOCMD;
         break;
+    }
+
+    /* Phase 7a: log this BeginIO invocation into the cmdlog ring so
+     * DBG_CMDLOG can dump what Roadshow does. Skip if this is the
+     * DBG_CMDLOG or DBG_STATUS call itself — those spam the log. */
+    if (ioreq->ios2_Req.io_Command != V1000_DBG_CMDLOG
+        && ioreq->ios2_Req.io_Command != V1000_DBG_STATUS
+        && ioreq->ios2_Req.io_Command != V1000_DBG_DUMPTX) {
+        ULONG i = devBase->cmdlog_head & 31;
+        devBase->cmdlog[i].cmd   = ioreq->ios2_Req.io_Command;
+        devBase->cmdlog[i].ioerr = ioreq->ios2_Req.io_Error;
+        devBase->cmdlog[i].wire  = ioreq->ios2_WireError;
+        devBase->cmdlog_head++;
     }
 
     if (ioreq->ios2_Req.io_Flags & IOF_QUICK)

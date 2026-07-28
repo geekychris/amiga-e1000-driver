@@ -137,6 +137,17 @@ struct Virte1000Base
     volatile ULONG      task_wake_count;
     volatile ULONG      process_rx_dd_seen;
     volatile ULONG      process_rx_delivered;
+
+    /* Phase 7a diagnostic ring: last 32 BeginIO commands so a test can
+     * see what Roadshow actually issued when a bind fails. Compact
+     * per-entry format so an entire snapshot fits in one 16-byte
+     * ios2_SrcAddr+DstAddr overlay. */
+    volatile ULONG      cmdlog_head;    /* next slot to write */
+    struct {
+        UWORD  cmd;         /* io_Command */
+        WORD   ioerr;       /* io_Error we returned */
+        ULONG  wire;        /* WireError we returned */
+    }                   cmdlog[32];
 };
 
 /* Per-opener state — one entry per OpenDevice() call. Stashes the
@@ -188,5 +199,13 @@ struct V1000Opener
                                      * header + 2 payload bytes) into
                                      * ios2_SrcAddr[0..15]. Diagnostic
                                      * for cooked-mode framing bugs. */
+#define V1000_DBG_CMDLOG   0xF006   /* Dump the last N BeginIO command
+                                     * IDs + io_Error + wire into
+                                     * ios2_Data (caller supplies a
+                                     * UBYTE buffer of at least
+                                     * 32*8 = 256 bytes). Returns count
+                                     * of entries in ios2_DataLength.
+                                     * Used to trace Roadshow's command
+                                     * sequence when a bind fails. */
 
 #endif
