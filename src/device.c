@@ -1124,8 +1124,18 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
     BPTR seglist = (BPTR)NULL;
 
     /* Find + remove this caller's Opener from the list. Matching by
-     * bm_cookie — a caller could Open twice with the same cookie
-     * (unusual), we free the first-found. */
+     * bm_cookie — since Phase 7a's BM-cookie rewrite, cookie is now
+     * a pointer to the opener itself (self-referential). Roadshow
+     * calls CloseDevice with the same cookie it received at Open.
+     *
+     * CRITICAL: drain the opener's read_queue BEFORE freeing. Roadshow
+     * (and any well-behaved caller) is supposed to AbortIO its pending
+     * requests first, but if any survive to Close, we MUST reply them
+     * — otherwise the caller's WaitIO deadlocks forever and their
+     * request memory leaks. Reply with IOERR_ABORTED, same as if
+     * AbortIO had been called. Also removes the opener from the
+     * driver-side list atomically so the unit_task's process_rx
+     * doesn't race and try to deliver into a freed opener. */
     {
         struct ExecIFace *IExec = devBase->IExec;
         struct V1000Opener *op, *found = NULL;
@@ -1136,7 +1146,20 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
              op = (struct V1000Opener *)op->node.mln_Succ) {
             if (op->bm_cookie == cookie) { found = op; break; }
         }
-        if (found) IExec->Remove((struct Node *)&found->node);
+        if (found) {
+            /* Drain queued CMD_READs while still holding opener_lock —
+             * this locks out process_rx from adding/removing anything.
+             * A Node is at offset 0 of IOSana2Req (through io_Message
+             * at offset 0 of ios2_Req at offset 0), so cast directly. */
+            struct Node *node;
+            while ((node = IExec->RemHead(
+                        (struct List *)&found->read_queue)) != NULL) {
+                struct IOSana2Req *pending = (struct IOSana2Req *)node;
+                pending->ios2_Req.io_Error = IOERR_ABORTED;
+                IExec->ReplyMsg((struct Message *)pending);
+            }
+            IExec->Remove((struct Node *)&found->node);
+        }
         IExec->ReleaseSemaphore(&devBase->opener_lock);
         if (found) IExec->FreeVec(found);
     }
