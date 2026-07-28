@@ -404,6 +404,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->last_icr      = 0;
     devBase->state         = V1000_STATE_OFFLINE;
     devBase->tx_next_slot  = 0;
+    devBase->UtilityBase   = NULL;
+    devBase->IUtility      = NULL;
+    iexec->NewList((struct List *)&devBase->opener_list);
+    iexec->InitSemaphore(&devBase->opener_lock);
 
     /* Phase 6d: init the embedded unit's MsgPort. PA_IGNORE tells exec
      * "don't queue+signal, just call BeginIO synchronously". That's the
@@ -445,6 +449,18 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * failure at any step is logged and left as NULL — Init STILL returns
      * OK so the loop test (testopen) keeps passing. Hardware ops added in
      * later phases will refuse cleanly if pciDevice is NULL. */
+
+    /* utility.library — needed for GetTagData at Open time and
+     * CallHookPkt for cooked-mode TX/RX copies. Open before PCI stuff
+     * so we can bail cleanly if it's not available. */
+    devBase->UtilityBase = iexec->OpenLibrary("utility.library", 50);
+    if (devBase->UtilityBase) {
+        devBase->IUtility = (struct UtilityIFace *)
+            iexec->GetInterface(devBase->UtilityBase, "main", 1, NULL);
+    }
+    LOGF(log, (CONST_STRPTR)"utility.library: %s IUtility=%p\n",
+         devBase->UtilityBase ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
+         devBase->IUtility);
 
     devBase->ExpansionBase = iexec->OpenLibrary("expansion.library", 53);
     if (!devBase->ExpansionBase) {
@@ -803,15 +819,43 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
     }
 
     /* Phase 6d: hand out the real unit pointer so exec's async-path
-     * dispatch (needed for CMD_WRITE / S2_BROADCAST / S2_MULTICAST)
-     * finds a valid MsgPort. Fake devBase-cast worked for direct-
-     * dispatch commands but returned -6 for anything routed through
-     * unit_MsgPort. Increment unit_OpenCnt to mirror lib_OpenCnt so
-     * exec sees the unit as actively used. */
+     * dispatch finds a valid MsgPort. Increment unit_OpenCnt to mirror
+     * lib_OpenCnt so exec sees the unit as actively used. */
     ioreq->ios2_Req.io_Unit   = &devBase->v1000_unit;
     ioreq->ios2_Req.io_Error  = 0;
     devBase->v1000_unit.unit_OpenCnt++;
     devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
+
+    /* -------- Phase 6j-1: per-opener state ----------
+     * Allocate a V1000Opener for this Open. Parse ios2_BufferManagement
+     * (SANA-II Rev 4 tag list) for S2_CopyFromBuff and S2_CopyToBuff —
+     * the caller-supplied function pointers we'll invoke via
+     * IUtility->CallHookPkt on TX and RX. NULL is fine (RAW-only
+     * clients like testtx don't set them). */
+    struct V1000Opener *op = (struct V1000Opener *)devBase->IExec->AllocVecTags(
+        sizeof(struct V1000Opener),
+        AVT_Type,           MEMF_SHARED,
+        AVT_ClearWithValue, 0,
+        TAG_END);
+    if (!op) {
+        /* Non-fatal for legacy RAW-only callers, but flag the error field
+         * to signal the caller that cooked-mode won't work. */
+        devBase->IExec->DebugPrintF("[virte1000] Open: opener alloc failed\n");
+        /* Continue anyway — testopen etc. don't rely on opener state. */
+    } else {
+        op->bm_cookie = ioreq->ios2_BufferManagement;
+        if (op->bm_cookie && devBase->IUtility) {
+            struct TagItem *tags = (struct TagItem *)op->bm_cookie;
+            op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                S2_CopyFromBuff, 0, tags);
+            op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                S2_CopyToBuff, 0, tags);
+        }
+        devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
+        devBase->IExec->AddTail((struct List *)&devBase->opener_list,
+                                 (struct Node *)&op->node);
+        devBase->IExec->ReleaseSemaphore(&devBase->opener_lock);
+    }
 
     return devBase;
 }
@@ -820,6 +864,24 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
 {
     struct Virte1000Base *devBase = (struct Virte1000Base *)Self->Data.LibBase;
     BPTR seglist = (BPTR)NULL;
+
+    /* Find + remove this caller's Opener from the list. Matching by
+     * bm_cookie — a caller could Open twice with the same cookie
+     * (unusual), we free the first-found. */
+    {
+        struct ExecIFace *IExec = devBase->IExec;
+        struct V1000Opener *op, *found = NULL;
+        APTR cookie = ioreq->ios2_BufferManagement;
+        IExec->ObtainSemaphore(&devBase->opener_lock);
+        for (op = (struct V1000Opener *)devBase->opener_list.mlh_Head;
+             op->node.mln_Succ;
+             op = (struct V1000Opener *)op->node.mln_Succ) {
+            if (op->bm_cookie == cookie) { found = op; break; }
+        }
+        if (found) IExec->Remove((struct Node *)&found->node);
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+        if (found) IExec->FreeVec(found);
+    }
 
     ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
     ioreq->ios2_Req.io_Device = (struct Device *)-1;
@@ -859,17 +921,27 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
         /* Release resources in reverse-acquire order.
          *
          * FIRST: mask interrupts + remove the IntServer so a late-arriving
-         * interrupt can't dereference base fields we're about to free.
-         * Since IMS is only touched from Init (masked with IMC there),
-         * this write may be a no-op — but the RemIntServer must happen. */
+         * interrupt can't dereference base fields we're about to free. */
         if (devBase->bar0) {
             volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-            e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);   /* mask all */
-            (void)e1000_read32(mmio, E1000_REG_ICR);            /* clear pending */
+            e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+            (void)e1000_read32(mmio, E1000_REG_ICR);
         }
         if (devBase->irq_installed) {
             IExec->RemIntServer(devBase->irq_vector, &devBase->irq_node);
             devBase->irq_installed = FALSE;
+        }
+
+        /* Free any Openers still on the list (there shouldn't be any at
+         * Expunge time — Close should have cleaned up — but defensive). */
+        {
+            struct V1000Opener *op;
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            while ((op = (struct V1000Opener *)
+                    IExec->RemHead((struct List *)&devBase->opener_list)) != NULL) {
+                IExec->FreeVec(op);
+            }
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
 
         if (devBase->rx_buffers) { IExec->FreeVec(devBase->rx_buffers); devBase->rx_buffers = NULL; }
@@ -890,6 +962,14 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
         if (devBase->ExpansionBase) {
             IExec->CloseLibrary(devBase->ExpansionBase);
             devBase->ExpansionBase = NULL;
+        }
+        if (devBase->IUtility) {
+            IExec->DropInterface((struct Interface *)devBase->IUtility);
+            devBase->IUtility = NULL;
+        }
+        if (devBase->UtilityBase) {
+            IExec->CloseLibrary(devBase->UtilityBase);
+            devBase->UtilityBase = NULL;
         }
 
         IExec->DebugPrintF("[virte1000] Expunge: goodbye.\n");

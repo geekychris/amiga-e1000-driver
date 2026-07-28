@@ -12,6 +12,9 @@
 #include <devices/sana2.h>
 #include <expansion/pci.h>    /* PCIDevice, PCIResourceRange */
 #include <interfaces/expansion.h>  /* PCIIFace method definitions */
+#include <utility/tagitem.h>
+#include <utility/hooks.h>
+#include <interfaces/utility.h>
 
 #include <proto/exec.h>
 
@@ -97,6 +100,32 @@ struct Virte1000Base
      * synchronously — same net effect as the old fake io_Unit but with
      * a valid MsgPort structure. Single unit only (unit 0). */
     struct Unit      v1000_unit;
+
+    /* Phase 6j: per-opener state. utility.library IUtility gives us
+     * the tag-list parsing we need at Open (S2_CopyFromBuff /
+     * S2_CopyToBuff lookup) and CallHookPkt for later cooked-mode
+     * TX/RX. opener_list is a MinList of V1000Opener nodes; opener_lock
+     * serialises Add/Remove against future ISR-driven RX delivery. */
+    struct Library     *UtilityBase;
+    struct UtilityIFace *IUtility;
+    struct MinList      opener_list;
+    struct SignalSemaphore opener_lock;
+};
+
+/* Per-opener state — one entry per OpenDevice() call. Stashes the
+ * caller's buffer-management cookie plus (once we implement it) the
+ * SANA-II copy hook function pointers (see SANA-II-NOTES §7). List
+ * lives in Virte1000Base.opener_list; Open adds, Close removes. */
+struct V1000Opener
+{
+    struct MinNode  node;
+    APTR            bm_cookie;      /* the ios2_BufferManagement value */
+    /* SANA-II Rev 4 tag-list-resolved hooks. Function pointers pulled
+     * from the caller's BufferManagement tag list at Open time via
+     * IUtility->GetTagData. NULL if the caller didn't supply them
+     * (e.g. RAW-only clients like testtx). */
+    APTR            copy_from_buff;
+    APTR            copy_to_buff;
 };
 
 /* Unit-state values held in Virte1000Base.state. Defined as constants
