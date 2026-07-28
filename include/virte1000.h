@@ -70,6 +70,14 @@ struct Virte1000Base
      * (writes RCTL.EN, TCTL.EN, unmasks IMS). S2_OFFLINE demotes back
      * to CONFIGURED (masks IMS, clears RCTL.EN, TCTL.EN, retains MAC). */
     ULONG            state;   /* V1000_STATE_* below */
+
+    /* Phase 6b: TX ring producer index. Next TX descriptor to fill on
+     * CMD_WRITE. Wraps at V1000_RING_ENTRIES. Since we currently reply
+     * synchronously (poll for TDH advance) there is only ever ONE
+     * outstanding descriptor at a time, so tx_next_slot doesn't really
+     * need to be a full ring — but keeping it as a slot index gets the
+     * bookkeeping right for the future async version. */
+    ULONG            tx_next_slot;
 };
 
 /* Unit-state values held in Virte1000Base.state. Defined as constants
