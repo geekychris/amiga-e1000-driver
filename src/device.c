@@ -1005,26 +1005,59 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     }
 
     case V1000_DBG_STATUS: {
-        /* virte1000 private: return runtime state to test programs.
-         * Not in any SANA-II (< 0x38) or new-style (0xC000+) range.
-         * Overloads reply fields:
+        /* virte1000 private diagnostic. Field overloads:
          *   ios2_DataLength = irq_counter (total ISR fires since Init)
          *   ios2_WireError  = last_icr    (bitmap of last causes seen)
          *   ios2_PacketType = state       (V1000_STATE_*)
-         * If online we also stash Total Packets Transmitted in the
-         * SrcAddr[0..3] bytes so testtx can grep it — the alternative
-         * would be adding another private command or another IOSana2Req
-         * field abuse, and this stays cheap. */
+         *   ios2_SrcAddr[0..3] = TPT (Total Packets Transmitted)
+         *   ios2_SrcAddr[4..7] = RDH (RX Descriptor Head — advances on each
+         *                       packet HW DMAs into our ring; also
+         *                       accumulates count of DD-set descriptors)
+         *   ios2_DstAddr[0..3] = count of RX descriptors whose STATUS.DD
+         *                       bit is currently set (unclaimed packets)
+         *   ios2_DstAddr[4..5] = length of first DD-set RX descriptor
+         */
         ioreq->ios2_DataLength = devBase->irq_counter;
         ioreq->ios2_WireError  = devBase->last_icr;
         ioreq->ios2_PacketType = devBase->state;
         if (devBase->state == V1000_STATE_ONLINE && devBase->bar0) {
             volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
             uint32 tpt = e1000_read32(mmio, E1000_REG_TPT);
+            uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
             ioreq->ios2_SrcAddr[0] = (UBYTE)(tpt >> 24);
             ioreq->ios2_SrcAddr[1] = (UBYTE)(tpt >> 16);
             ioreq->ios2_SrcAddr[2] = (UBYTE)(tpt >> 8);
             ioreq->ios2_SrcAddr[3] = (UBYTE)(tpt);
+            ioreq->ios2_SrcAddr[4] = (UBYTE)(rdh >> 24);
+            ioreq->ios2_SrcAddr[5] = (UBYTE)(rdh >> 16);
+            ioreq->ios2_SrcAddr[6] = (UBYTE)(rdh >> 8);
+            ioreq->ios2_SrcAddr[7] = (UBYTE)(rdh);
+
+            /* Scan RX descriptors for STATUS.DD set. Reset SrcAddr[0..3]
+             * ← wait we just used those for TPT. Use DstAddr for the DD
+             * scan instead. */
+            ULONG dd_count = 0;
+            ULONG first_len = 0;
+            if (devBase->rx_ring) {
+                volatile UBYTE *rr = (volatile UBYTE *)devBase->rx_ring;
+                for (int i = 0; i < V1000_RING_ENTRIES; i++) {
+                    volatile UBYTE *rd = rr + (i * V1000_DESC_SIZE);
+                    /* Legacy RX descriptor: bytes 8-9 = length (LE),
+                     * byte 12 = status (bit 0 = DD, done). */
+                    if (rd[12] & 0x01) {
+                        if (dd_count == 0) {
+                            first_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
+                        }
+                        dd_count++;
+                    }
+                }
+            }
+            ioreq->ios2_DstAddr[0] = (UBYTE)(dd_count >> 24);
+            ioreq->ios2_DstAddr[1] = (UBYTE)(dd_count >> 16);
+            ioreq->ios2_DstAddr[2] = (UBYTE)(dd_count >> 8);
+            ioreq->ios2_DstAddr[3] = (UBYTE)(dd_count);
+            ioreq->ios2_DstAddr[4] = (UBYTE)(first_len >> 8);
+            ioreq->ios2_DstAddr[5] = (UBYTE)(first_len);
         }
         break;
     }

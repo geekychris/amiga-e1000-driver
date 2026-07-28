@@ -41,7 +41,7 @@ DEV_DBG  = $(BUILD)/virte1000.device.debug
 
 # Add every test binary here as it lands. Each corresponds to
 # tests/<name>.c, compiled the same way.
-TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx
+TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRC  = src/device.c
