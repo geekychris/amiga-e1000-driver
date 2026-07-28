@@ -96,6 +96,8 @@ int main(int argc, char **argv)
     LONG rc_on = do_cmd(req, S2_ONLINE);
     if (rc_on != 0) { IDOS->Printf("RESULT: FAIL ONLINE=%ld\n", (long)rc_on); goto out; }
 
+    /* e1000 statistics registers self-clear on read — see testtx.c. */
+    (void)read_tpt(req);
     ULONG tpt_before = read_tpt(req);
     IDOS->Printf("TPT before cooked send: %lu\n", (unsigned long)tpt_before);
 

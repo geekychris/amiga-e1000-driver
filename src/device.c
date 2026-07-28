@@ -981,16 +981,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
-    /* Phase 6k: unit task infrastructure is implemented but starting
-     * it here breaks debug-force-Expunge — some subtle lifecycle race
-     * where task_stop doesn't fully clean up before the next test's
-     * OpenDevice, so state persists across "fresh" Init cycles. The
-     * task_start / task_stop / v1000_process_rx / CMD_READ enqueue
-     * code paths are ready; enable when we have a proper AbortIO and
-     * a way to keep the driver resident across tests without state
-     * pollution. */
-    LOGF(log, (CONST_STRPTR)"unit task: NOT STARTED (see comment above)\n");
-    (void)v1000_task_start;   /* silence unused-warning */
+    /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal. */
+    BOOL task_ok = v1000_task_start(devBase, iexec);
+    LOGF(log, (CONST_STRPTR)"unit task: %s (task=%p mask=%08lx)\n",
+         task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
+         devBase->unit_task, (ULONG)devBase->unit_signal_mask);
 
     /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
      * S2_ONLINE (or the debug V1000_DBG_FIRE_IRQ, once online) to make
@@ -1735,7 +1730,35 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
 
 LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
-    (void)Self; (void)ioreq;
-    /* Nothing is queued yet — nothing to abort. */
-    return IOERR_NOCMD;
+    /* Phase 6l: honest AbortIO. Walk every opener's read_queue looking
+     * for this request; if found, unlink and reply with IOERR_ABORTED.
+     * Without this, a caller who SendIO's CMD_READ then AbortIO's it
+     * (because timeout / user cancel / test cleanup) will have their
+     * WaitIO block forever — the request never gets ReplyMsg'd. */
+    struct Virte1000Base *base = (struct Virte1000Base *)Self->Data.LibBase;
+    struct ExecIFace *IExec = base->IExec;
+    struct V1000Opener *op;
+    struct MinNode *node, *next;
+    BOOL found = FALSE;
+
+    IExec->ObtainSemaphore(&base->opener_lock);
+    for (op = (struct V1000Opener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ && !found;
+         op = (struct V1000Opener *)op->node.mln_Succ) {
+        for (node = op->read_queue.mlh_Head;
+             (next = node->mln_Succ) != NULL;
+             node = next) {
+            if ((APTR)node == (APTR)&ioreq->ios2_Req.io_Message.mn_Node) {
+                IExec->Remove((struct Node *)node);
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    IExec->ReleaseSemaphore(&base->opener_lock);
+
+    if (!found) return IOERR_NOCMD;   /* not on any queue */
+    ioreq->ios2_Req.io_Error = IOERR_ABORTED;
+    IExec->ReplyMsg((struct Message *)ioreq);
+    return 0;
 }

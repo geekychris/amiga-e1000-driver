@@ -82,6 +82,10 @@ int main(int argc, char **argv)
     LONG rc_on = do_cmd(req, S2_ONLINE);
     if (rc_on != 0) { IDOS->Printf("RESULT: FAIL ONLINE=%ld\n", (long)rc_on); goto out; }
 
+    /* e1000 statistics registers self-clear on read. If a previous test
+     * in the same suite already sent a frame, TPT would show residual
+     * count. Pre-read discards it so the second read is a true baseline. */
+    (void)read_tpt(req);
     ULONG tpt_before = read_tpt(req);
     IDOS->Printf("TPT before send: %lu\n", (unsigned long)tpt_before);
 
