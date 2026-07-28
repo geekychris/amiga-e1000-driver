@@ -63,6 +63,26 @@ struct Virte1000Base
     BOOL             irq_installed;
     volatile ULONG   irq_counter;
     volatile ULONG   last_icr;
+
+    /* Phase 6a: SANA-II state machine. Init leaves us OFFLINE with rings
+     * programmed but RX/TX disabled and IRQs masked. S2_CONFIGINTERFACE
+     * promotes to CONFIGURED (one-shot). S2_ONLINE promotes to ONLINE
+     * (writes RCTL.EN, TCTL.EN, unmasks IMS). S2_OFFLINE demotes back
+     * to CONFIGURED (masks IMS, clears RCTL.EN, TCTL.EN, retains MAC). */
+    ULONG            state;   /* V1000_STATE_* below */
 };
+
+/* Unit-state values held in Virte1000Base.state. Defined as constants
+ * rather than an enum so testonline can #include this header without
+ * dragging in the whole libBase struct. */
+#define V1000_STATE_OFFLINE     0   /* fresh from Init or reset */
+#define V1000_STATE_CONFIGURED  1   /* MAC programmed, hardware idle */
+#define V1000_STATE_ONLINE      2   /* RX/TX enabled, IRQs unmasked */
+
+/* Private debug command IDs — kept in header so tests can #include and
+ * share the values. Well outside SANA-II (< 0x38) and new-style (0xC000+)
+ * ranges, so no chance of colliding with a spec command. */
+#define V1000_DBG_STATUS   0xF001   /* returns counter/icr/state */
+#define V1000_DBG_FIRE_IRQ 0xF002   /* ICS.LSC → forces one ISR call */
 
 #endif

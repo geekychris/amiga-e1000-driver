@@ -323,6 +323,7 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     devBase->irq_installed = FALSE;
     devBase->irq_counter   = 0;
     devBase->last_icr      = 0;
+    devBase->state         = V1000_STATE_OFFLINE;
     for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
 
     devBase->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
@@ -611,62 +612,12 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
              (ULONG)e1000_read32(mmio, E1000_REG_TDT));
     }
 
-    /* -------- Phase 4e: enable RX (single RCTL write) ----------
-     * DESIGN.md §3 flagged QEMU's flush_queue_timer: writing RCTL stalls
-     * RX for 1 s. Do it ONCE, last, so we don't re-arm the timer.
-     * Flags used:
-     *   EN     = bit 1 (Receiver Enable)
-     *   BAM    = bit 15 (Broadcast Accept Mode — pass broadcast frames)
-     *   BSIZE  = 00 (bits 16-17) → 2048 B, matching our rx_buffers stride
-     *   BSEX   = 0  (bit 25, BSIZE not extended)
-     *   SECRC  = bit 26 (Strip Ethernet CRC on RX, so lengths match L2)
-     * Everything else (LBM, LPE, promisc, threshold) stays default 0. */
-#define E1000_RCTL_EN     (1U << 1)
-#define E1000_RCTL_BAM    (1U << 15)
-#define E1000_RCTL_SECRC  (1U << 26)
-    if (devBase->rx_ring && devBase->rx_buffers) {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC;
-        e1000_write32(mmio, E1000_REG_RCTL, rctl);
-
-        uint32 rctl_readback = e1000_read32(mmio, E1000_REG_RCTL);
-        uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
-        uint32 rdt = e1000_read32(mmio, E1000_REG_RDT);
-        LOGF(log, (CONST_STRPTR)"RX enabled: RCTL=%08lx (written %08lx) RDH=%lu RDT=%lu\n",
-             (ULONG)rctl_readback, (ULONG)rctl, (ULONG)rdh, (ULONG)rdt);
-        if (rctl_readback != rctl) {
-            LOGF(log, (CONST_STRPTR)"RX enabled: WARNING - RCTL readback mismatch "
-                 "(reserved bits or QEMU stubbed field)\n");
-        }
-    }
-
-    /* -------- Phase 4f: enable TX ----------
-     * TCTL bits:
-     *   EN   = bit 1  (Transmit Enable)
-     *   PSP  = bit 3  (Pad Short Packets to 64 B)
-     *   CT   = bits 4-11 (Collision Threshold; 0x0F standard, ignored on
-     *                     full-duplex which QEMU always is)
-     *   COLD = bits 12-21 (Collision Distance; 0x40 for full-duplex)
-     * Everything else stays 0. Value = 0x0004_00FA. */
-#define E1000_TCTL_EN     (1U << 1)
-#define E1000_TCTL_PSP    (1U << 3)
-#define E1000_TCTL_CT(v)   (((v) & 0xff)  << 4)
-#define E1000_TCTL_COLD(v) (((v) & 0x3ff) << 12)
-    if (devBase->tx_ring) {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 tctl = E1000_TCTL_EN | E1000_TCTL_PSP
-                    | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40);
-        e1000_write32(mmio, E1000_REG_TCTL, tctl);
-
-        uint32 tctl_readback = e1000_read32(mmio, E1000_REG_TCTL);
-        LOGF(log, (CONST_STRPTR)"TX enabled: TCTL=%08lx (written %08lx)\n",
-             (ULONG)tctl_readback, (ULONG)tctl);
-        if (tctl_readback != tctl) {
-            LOGF(log, (CONST_STRPTR)"TX enabled: WARNING - TCTL readback mismatch\n");
-        }
-    }
-
-    /* -------- Phase 5a+b: map + install IRQ handler ----------
+    /* Phase 4e/f (RX/TX enable) + Phase 5c/d (IMS unmask) moved to
+     * v1000_online() and only run when S2_ONLINE fires. Init leaves us
+     * with rings programmed but the device idle — that's the SANA-II
+     * spec's OFFLINE state.
+     *
+     * -------- Phase 5a+b: map + install IRQ handler ----------
      * MapInterrupt resolves config-space InterruptLine to a system vector.
      * Then AddIntServer chains us on the shared PCI INTx server list.
      * IMS still 0 (all sources masked) — Phase 5c unmasks LSC below. */
@@ -693,38 +644,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
-    /* -------- Phase 5c+d: unmask LSC + RXT0 + TXDW; verify with ICS ----
-     * LSC  (bit 2) — Link Status Change (spontaneous, but not without a
-     *                link event; QEMU never toggles it after boot).
-     * RXT0 (bit 7) — Receive Timer; RX packet(s) delivered.
-     * TXDW (bit 0) — TX Descriptor Written back.
-     * Full production mask. As a sanity check we then poke ICS.LSC to
-     * synthesise one interrupt and confirm the ISR ran (counter++). */
-#define E1000_INTR_TXDW    (1U << 0)
-#define E1000_INTR_LSC     (1U << 2)
-#define E1000_INTR_RXT0    (1U << 7)
-    if (devBase->irq_installed && devBase->bar0) {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-
-        ULONG before_cnt = devBase->irq_counter;
-        e1000_write32(mmio, E1000_REG_IMS,
-                      E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
-        ULONG after_ims_cnt = devBase->irq_counter;
-
-        /* ICS-forced fire proves the whole PIC → IntServer → ISR chain
-         * without needing real packet traffic. */
-        e1000_write32(mmio, E1000_REG_ICS, E1000_INTR_LSC);
-
-        /* Busy-wait for counter to move (or fall through after ~100k
-         * iters if the interrupt didn't materialise). Reading ICR here
-         * would consume causes and hide the actual state. */
-        for (int i = 0; i < 100000 && devBase->irq_counter == after_ims_cnt; i++)
-            __asm__ volatile ("" : : : "memory");
-
-        LOGF(log, (CONST_STRPTR)"IRQ test: cnt before-IMS=%lu after-IMS=%lu after-ICS=%lu last_icr=%08lx\n",
-             (ULONG)before_cnt, (ULONG)after_ims_cnt,
-             (ULONG)devBase->irq_counter, (ULONG)devBase->last_icr);
-    }
+    /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
+     * S2_ONLINE (or the debug V1000_DBG_FIRE_IRQ, once online) to make
+     * the device live. */
+    LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE (need S2_CONFIGINTERFACE + S2_ONLINE)\n");
 
     v1000_log_close(iexec, &log);
     return (struct Library *)devBase;
@@ -839,6 +762,44 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
     return seglist;
 }
 
+/* -------- Phase 6a: online/offline hardware helpers ----------
+ * Called from BeginIO's S2_ONLINE / S2_OFFLINE cases (below). Keeping
+ * the actual register writes here rather than inline in the dispatch
+ * so the state-machine logic stays readable and the hardware sequence
+ * can be reused by future code paths (S2_CONFIGINTERFACE that changes
+ * MAC while online would need offline-then-online semantics, for
+ * example). */
+#define E1000_RCTL_EN     (1U << 1)
+#define E1000_RCTL_BAM    (1U << 15)
+#define E1000_RCTL_SECRC  (1U << 26)
+#define E1000_TCTL_EN     (1U << 1)
+#define E1000_TCTL_PSP    (1U << 3)
+#define E1000_TCTL_CT(v)   (((v) & 0xff)  << 4)
+#define E1000_TCTL_COLD(v) (((v) & 0x3ff) << 12)
+#define E1000_INTR_TXDW    (1U << 0)
+#define E1000_INTR_LSC     (1U << 2)
+#define E1000_INTR_RXT0    (1U << 7)
+
+static void v1000_online_hw(struct Virte1000Base *base)
+{
+    if (!base->bar0) return;
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+    e1000_write32(mmio, E1000_REG_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+    e1000_write32(mmio, E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP
+                                       | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40));
+    e1000_write32(mmio, E1000_REG_IMS, E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
+}
+
+static void v1000_offline_hw(struct Virte1000Base *base)
+{
+    if (!base->bar0) return;
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+    e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+    (void)e1000_read32(mmio, E1000_REG_ICR);
+    e1000_write32(mmio, E1000_REG_RCTL, 0);
+    e1000_write32(mmio, E1000_REG_TCTL, 0);
+}
+
 void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
     struct Virte1000Base *devBase = (struct Virte1000Base *)Self->Data.LibBase;
@@ -880,15 +841,90 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
-    case 0xF001: {
-        /* virte1000 private: return runtime IRQ counters. Not in any SANA-II
-         * or exec command range (0..0x38, 0xC000..). Used only by testirq.
+    case V1000_DBG_STATUS: {
+        /* virte1000 private: return runtime state to test programs.
+         * Not in any SANA-II (< 0x38) or new-style (0xC000+) range.
          * Overloads reply fields:
          *   ios2_DataLength = irq_counter (total ISR fires since Init)
-         *   ios2_WireError  = last_icr    (bitmap of last observed causes)
-         */
+         *   ios2_WireError  = last_icr    (bitmap of last causes seen)
+         *   ios2_PacketType = state       (V1000_STATE_*) */
         ioreq->ios2_DataLength = devBase->irq_counter;
         ioreq->ios2_WireError  = devBase->last_icr;
+        ioreq->ios2_PacketType = devBase->state;
+        break;
+    }
+
+    case V1000_DBG_FIRE_IRQ: {
+        /* Force one ISR fire via ICS. Only meaningful when we're ONLINE
+         * (IMS unmask must have already happened) — otherwise ICR bits
+         * set here are just masked and never delivered. Used by testirq
+         * to verify the IRQ path end-to-end after state transitions. */
+        if (devBase->state != V1000_STATE_ONLINE || !devBase->bar0) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+        e1000_write32(mmio, E1000_REG_ICS, E1000_INTR_LSC);
+        /* Return the (probably updated) counter for convenience. */
+        ioreq->ios2_DataLength = devBase->irq_counter;
+        break;
+    }
+
+    case S2_CONFIGINTERFACE: {
+        /* SANA-II-NOTES §3.3: caller sets ios2_SrcAddr = MAC to program;
+         * all-zeros means "use factory". May be called ONCE — second call
+         * from any state returns BAD_STATE / IS_CONFIGURED. */
+        if (devBase->state != V1000_STATE_OFFLINE) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
+            break;
+        }
+        /* Detect all-zeros SrcAddr → keep factory MAC. Otherwise we'd
+         * write the caller-supplied MAC into RAL/RAH here; Phase 6a
+         * defers the actual re-program until we exercise it from a test
+         * (avoids touching hardware in the untested happy path). */
+        BOOL want_factory = TRUE;
+        for (int i = 0; i < 6; i++)
+            if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
+        if (!want_factory) {
+            /* TODO Phase 6b: program RAL/RAH from ios2_SrcAddr. For now
+             * we accept the request and refuse to bounce the factory MAC,
+             * so callers can pass their own address without an error but
+             * the physical MAC on the wire won't actually change until we
+             * wire the write. */
+        }
+        devBase->state = V1000_STATE_CONFIGURED;
+        break;
+    }
+
+    case S2_ONLINE: {
+        /* SANA-II-NOTES §3.4: requires CONFIGURED. On success enables
+         * RX/TX and unmasks IRQs, transitions state to ONLINE. */
+        if (devBase->state == V1000_STATE_ONLINE) {
+            /* Idempotent success — no state change, no hardware toggle. */
+            break;
+        }
+        if (devBase->state != V1000_STATE_CONFIGURED) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
+            break;
+        }
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        break;
+    }
+
+    case S2_OFFLINE: {
+        /* SANA-II-NOTES §3.5: always succeeds. Disables hardware and
+         * demotes to CONFIGURED (config retained; caller can S2_ONLINE
+         * again without re-configuring). */
+        if (devBase->state == V1000_STATE_ONLINE) {
+            v1000_offline_hw(devBase);
+            devBase->state = V1000_STATE_CONFIGURED;
+        }
+        /* Phase 6c will: reply all pending IO requests with S2ERR_OUTOFSERVICE
+         * and signal S2EVENT_OFFLINE to ONEVENT queues. Nothing queued yet. */
         break;
     }
 

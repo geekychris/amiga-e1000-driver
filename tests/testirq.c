@@ -1,10 +1,14 @@
 /*
- * testirq — verify IRQ delivery.
+ * testirq — verify IRQ delivery end-to-end.
  *
- * Init has already forced one interrupt via ICS write (see Phase 5d in
- * device.c). testirq opens the device and calls a driver-private status
- * command (io_Command 0xF001) that returns irq_counter + last_icr in
- * ios2_DataLength / ios2_WireError. PASS iff counter > 0.
+ * Sequence:
+ *   1. OpenDevice     (Init runs; state=OFFLINE; IRQ hook installed)
+ *   2. S2_CONFIGINTERFACE (OFFLINE → CONFIGURED)
+ *   3. S2_ONLINE      (CONFIGURED → ONLINE; RCTL/TCTL/IMS live)
+ *   4. V1000_DBG_STATUS  → capture baseline counter
+ *   5. V1000_DBG_FIRE_IRQ → driver writes ICS.LSC; ISR fires, counter++
+ *   6. V1000_DBG_STATUS  → capture new counter
+ * PASS iff counter increased.
  */
 
 #include <exec/errors.h>
@@ -14,7 +18,15 @@
 #include <proto/exec.h>
 #include <proto/dos.h>
 
-#define V1000_DBG_STATUS  0xF001
+#include "../include/virte1000.h"   /* V1000_STATE_*, V1000_DBG_* */
+
+static LONG do_cmd(struct IOSana2Req *req, UWORD cmd)
+{
+    req->ios2_Req.io_Command = cmd;
+    req->ios2_Req.io_Error   = 0;
+    req->ios2_WireError      = 0;
+    return IExec->DoIO((struct IORequest *)req);
+}
 
 int main(int argc, char **argv)
 {
@@ -37,29 +49,52 @@ int main(int argc, char **argv)
         return 20;
     }
 
-    req->ios2_Req.io_Command = V1000_DBG_STATUS;
-    req->ios2_DataLength = 0;
-    req->ios2_WireError  = 0;
-    LONG rc = IExec->DoIO((struct IORequest *)req);
+    /* SrcAddr all-zeros → "use factory MAC" per SANA-II Rev 7 §3.3. */
+    for (int i = 0; i < 16; i++) req->ios2_SrcAddr[i] = 0;
+    LONG rc_cfg = do_cmd(req, S2_CONFIGINTERFACE);
+    IDOS->Printf("S2_CONFIGINTERFACE  DoIO=%ld ioerr=%ld wire=%lu\n",
+                 (long)rc_cfg, (long)req->ios2_Req.io_Error,
+                 (unsigned long)req->ios2_WireError);
 
-    IDOS->Printf("V1000_DBG_STATUS  DoIO=%ld  io_Error=%ld\n",
-                 (long)rc, (long)req->ios2_Req.io_Error);
-    IDOS->Printf("  irq_counter = %lu\n", (unsigned long)req->ios2_DataLength);
-    IDOS->Printf("  last_icr    = 0x%08lx\n", (unsigned long)req->ios2_WireError);
+    LONG rc_on = do_cmd(req, S2_ONLINE);
+    IDOS->Printf("S2_ONLINE           DoIO=%ld ioerr=%ld wire=%lu\n",
+                 (long)rc_on, (long)req->ios2_Req.io_Error,
+                 (unsigned long)req->ios2_WireError);
+
+    do_cmd(req, V1000_DBG_STATUS);
+    ULONG before = req->ios2_DataLength;
+    IDOS->Printf("V1000_DBG_STATUS    counter=%lu icr=0x%08lx state=%lu\n",
+                 (unsigned long)req->ios2_DataLength,
+                 (unsigned long)req->ios2_WireError,
+                 (unsigned long)req->ios2_PacketType);
+
+    do_cmd(req, V1000_DBG_FIRE_IRQ);
+    IDOS->Printf("V1000_DBG_FIRE_IRQ  DoIO=  ioerr=%ld  new_counter=%lu\n",
+                 (long)req->ios2_Req.io_Error,
+                 (unsigned long)req->ios2_DataLength);
+
+    do_cmd(req, V1000_DBG_STATUS);
+    ULONG after = req->ios2_DataLength;
+    IDOS->Printf("V1000_DBG_STATUS    counter=%lu icr=0x%08lx state=%lu\n",
+                 (unsigned long)req->ios2_DataLength,
+                 (unsigned long)req->ios2_WireError,
+                 (unsigned long)req->ios2_PacketType);
+
+    /* Try to leave the device idle for the next test run. Errors here
+     * don't affect the PASS/FAIL verdict for testirq — Expunge would
+     * do the same masking on next reload anyway. */
+    do_cmd(req, S2_OFFLINE);
 
     IExec->CloseDevice((struct IORequest *)req);
     IExec->FreeSysObject(ASOT_IOREQUEST, req);
     IExec->FreeSysObject(ASOT_PORT, port);
 
-    /* Pass iff the ISR fired at least once during Init's ICS test.
-     * If counter is 0, either the ISR install failed silently, or the
-     * ICS-triggered fire was suppressed by something (unmapped IRQ line,
-     * masked at the PIC, etc.). */
-    BOOL pass = (rc == 0) && (req->ios2_Req.io_Error == 0)
-             && (req->ios2_DataLength > 0);
+    BOOL pass = (rc_cfg == 0 && req->ios2_Req.io_Error != S2ERR_BAD_STATE)
+             && (rc_on == 0)
+             && (after > before);
     if (pass) IDOS->Printf("RESULT: PASS\n");
-    else      IDOS->Printf("RESULT: FAIL rc=%ld ioerr=%ld counter=%lu\n",
-                           (long)rc, (long)req->ios2_Req.io_Error,
-                           (unsigned long)req->ios2_DataLength);
+    else      IDOS->Printf("RESULT: FAIL cfg=%ld on=%ld before=%lu after=%lu\n",
+                           (long)rc_cfg, (long)rc_on,
+                           (unsigned long)before, (unsigned long)after);
     return pass ? 0 : 20;
 }
