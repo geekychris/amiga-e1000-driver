@@ -1449,6 +1449,40 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             q->HardwareType = S2WireType_Ethernet;
         if (supply >= offsetof(struct Sana2DeviceQuery, RawMTU) + sizeof(ULONG))
             q->RawMTU = 1514;
+
+        /* Phase 7a DEFENSIVE: Roadshow's compile of struct
+         * Sana2DeviceQuery may have DIFFERENT layout than ours. Our
+         * OS4 SDK header has #pragma pack(2) so AddrFieldSize (UWORD
+         * at offset 16) is followed IMMEDIATELY by MTU (ULONG at
+         * offset 18). Barthel's Roadshow may have been compiled
+         * WITHOUT pack(2) — then AddrFieldSize (offset 16) has
+         * 2-byte alignment padding, MTU at offset 20, BPS at 24, etc.
+         * Roadshow reads MTU at offset 20 sees 0 (we didn't write
+         * there) - the "Could not allocate a network packet of 0
+         * bytes" mystery. Write the fields at BOTH plausible offsets
+         * to cover both compile ABIs. */
+        UBYTE *raw = (UBYTE *)q;
+        /* Offsets in a "no-pack" ABI (with 2-byte pad after AddrFieldSize) */
+        ULONG alt_MTU        = 20;
+        ULONG alt_BPS        = 24;
+        ULONG alt_HW         = 28;
+        ULONG alt_RawMTU     = 32;
+        if (supply >= alt_MTU + 4) {
+            raw[alt_MTU + 0] = 0x00; raw[alt_MTU + 1] = 0x00;
+            raw[alt_MTU + 2] = 0x05; raw[alt_MTU + 3] = 0xDC;   /* 1500 BE */
+        }
+        if (supply >= alt_BPS + 4) {
+            raw[alt_BPS + 0] = 0x3B; raw[alt_BPS + 1] = 0x9A;
+            raw[alt_BPS + 2] = 0xCA; raw[alt_BPS + 3] = 0x00;   /* 1G */
+        }
+        if (supply >= alt_HW + 4) {
+            raw[alt_HW + 0] = 0x00; raw[alt_HW + 1] = 0x00;
+            raw[alt_HW + 2] = 0x00; raw[alt_HW + 3] = 0x01;     /* Ethernet */
+        }
+        if (supply >= alt_RawMTU + 4) {
+            raw[alt_RawMTU + 0] = 0x00; raw[alt_RawMTU + 1] = 0x00;
+            raw[alt_RawMTU + 2] = 0x05; raw[alt_RawMTU + 3] = 0xEA;  /* 1514 */
+        }
         break;
     }
 
