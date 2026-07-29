@@ -61,7 +61,7 @@ int main(int argc, char **argv)
         TAG_END);
     if (!req) return 20;
 
-    LONG err = IExec->OpenDevice("sanashunt.device", 0, (struct IORequest *)req, 0);
+    LONG err = IExec->OpenDevice("sanashunt2.device", 0, (struct IORequest *)req, 0);
     if (err) {
         IDOS->Printf("RESULT: FAIL sanashunt Open=%ld\n", (long)err);
         return 20;

@@ -162,8 +162,12 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     struct SanaShuntBase *base = (struct SanaShuntBase *)library;
     struct ExecIFace *IExec = (struct ExecIFace *)exec;
 
+    /* Log BEFORE touching anything else, so we can tell if we get here
+     * at all. Previously nothing appeared in the log file — either
+     * kernel isn't calling Init, or something below crashes silently. */
+    shunt_init_log(IExec, "Init entered");
     IExec->DebugPrintF("[sanashunt] Init: " SHUNT_VERSTRING "\n");
-    shunt_init_log(IExec, "Init entered: " SHUNT_VERSTRING);
+    shunt_init_log(IExec, "Init: past DebugPrintF");
 
     base->IExec       = IExec;
     base->dev_SegList = seglist;

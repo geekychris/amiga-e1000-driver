@@ -14,7 +14,7 @@
 
 #include <proto/exec.h>
 
-#define SHUNT_NAME       "sanashunt.device"
+#define SHUNT_NAME       "sanashunt2.device"
 #define SHUNT_VER        0    /* Matches virte1000's DEVVER; kernel appears
                                * to reject Init on non-zero versions - see
                                * shunt.c Init comment. Real revision is
