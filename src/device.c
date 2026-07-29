@@ -1379,14 +1379,19 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         if (buf_size == 0) buf_size = size_full;
         ULONG size_out = (buf_size < size_full) ? buf_size : size_full;
         q->SizeSupplied  = size_out;
-        q->DevQueryFormat = 0;
-        q->DeviceLevel    = 0;
-        q->AddrFieldSize  = 48;
-        q->MTU            = 1500;
-        /* BPS: 100 Mbps (see BPS commit). */
-        q->BPS            = 100000000UL;
+        q->DevQueryFormat = 0;    /* SANA-II Rev 7 spec: type 0 */
+        q->DeviceLevel    = 0;    /* SANA-II Rev 7 spec: level 0 */
+        q->AddrFieldSize  = 48;   /* MAC size in bits */
+        q->MTU            = 1500; /* Ethernet default */
+        q->BPS            = 100000000UL;  /* 100 Mbps */
         q->HardwareType   = S2WireType_Ethernet;
-        q->RawMTU         = 1514;
+        q->RawMTU         = 1514; /* Ethernet frame max incl header */
+        /* Empirically confirmed (see NetLogViewer probe): Roadshow's
+         * "Could not allocate a network packet ... of 0 bytes" is
+         * unaffected by any of the fields above. The "0" is very
+         * likely a NULL pointer from a failed AllocSysObjectTags
+         * printed by Roadshow via %p, NOT a size-of-zero derived
+         * from our reply. Root cause is elsewhere. */
         break;
     }
 
