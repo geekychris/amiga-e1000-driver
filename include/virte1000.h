@@ -138,6 +138,20 @@ struct Virte1000Base
     volatile ULONG      process_rx_dd_seen;
     volatile ULONG      process_rx_delivered;
 
+    /* Phase 7a: snapshot of Roadshow's Sana2DeviceQuery buffer, taken
+     * INSIDE our S2_DEVICEQUERY handler. `deviceq_before` = raw bytes
+     * of *q from position 0..47 BEFORE we write anything; `deviceq_after`
+     * = same after our writes. Also record what q->SizeAvailable was on
+     * entry. Lets us verify:
+     *   (a) whether Roadshow allocates >= sizeof struct or smaller
+     *   (b) whether our writes actually land where we think
+     *   (c) whether Roadshow's INPUT MTU (uninitialised bytes) is
+     *       what we're seeing back in NetLogViewer's "0 bytes" */
+    volatile ULONG      deviceq_call_count;
+    volatile ULONG      deviceq_sizeavailable;
+    volatile UBYTE      deviceq_before[48];
+    volatile UBYTE      deviceq_after[48];
+
     /* Phase 7a diagnostic ring: last 32 BeginIO commands so a test can
      * see what Roadshow actually issued when a bind fails. Compact
      * per-entry format; V1000_DBG_CMDLOG dumps 32 x 40 bytes. */
@@ -224,5 +238,13 @@ struct V1000Opener
                                      * of entries in ios2_DataLength.
                                      * Used to trace Roadshow's command
                                      * sequence when a bind fails. */
+#define V1000_DBG_DQBUF    0xF007   /* Dump the last S2_DEVICEQUERY
+                                     * buffer snapshot. Copies:
+                                     *   ios2_SrcAddr[0..15] = header
+                                     *     (call_count / SizeAvailable
+                                     *     as 4-byte BE + 8 pad)
+                                     *   ios2_Data[0..47]   = before
+                                     *   ios2_Data[48..95]  = after
+                                     * Caller supplies >=96-byte buf. */
 
 #endif

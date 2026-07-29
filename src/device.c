@@ -1433,8 +1433,30 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * allocate a network packet of 0 bytes" NetLogViewer error
          * that persisted across every S2_DEVICEQUERY field value we
          * tried. The 0 is a real 0, not a NULL-pointer print. */
+        /* Phase 7a diagnostic: snapshot the caller's buffer BEFORE we
+         * write anything. This lets DBG_DQBUF dump what Roadshow
+         * allocated + initialized, so we can see if SizeAvailable is
+         * what we expect and whether writes past our SizeSupplied
+         * cap are actually landing outside a valid buffer. */
+        devBase->deviceq_call_count++;
+        devBase->deviceq_sizeavailable = q->SizeAvailable;
+        {
+            volatile UBYTE *src = (volatile UBYTE *)q;
+            volatile UBYTE *dst = devBase->deviceq_before;
+            for (int i = 0; i < 48; i++) dst[i] = src[i];
+        }
+
         ULONG size_full = (ULONG)sizeof(struct Sana2DeviceQuery);
-        ULONG supply    = q->SizeAvailable;
+        /* PHASE 7a ROOT-CAUSE FIX: Roadshow leaves q->SizeAvailable = 0
+         * (probed empirically via V1000_DBG_DQBUF snapshot). The
+         * previous "only write if supply >= offset" logic then
+         * skipped EVERY field, Roadshow read all zeros including
+         * MTU=0, and its post-CONFIG alloc failed with "Could not
+         * allocate a network packet ... of 0 bytes". Treat
+         * SizeAvailable=0 as "caller allocated the full struct" -
+         * Roadshow's buffer IS sizeof(struct Sana2DeviceQuery) bytes,
+         * just SizeAvailable isn't populated. */
+        ULONG supply    = q->SizeAvailable ? q->SizeAvailable : size_full;
         if (supply > size_full) supply = size_full;
         q->SizeSupplied   = supply;
         q->DevQueryFormat = 0;
@@ -1482,6 +1504,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         if (supply >= alt_RawMTU + 4) {
             raw[alt_RawMTU + 0] = 0x00; raw[alt_RawMTU + 1] = 0x00;
             raw[alt_RawMTU + 2] = 0x05; raw[alt_RawMTU + 3] = 0xEA;  /* 1514 */
+        }
+        /* Phase 7a diagnostic AFTER snapshot. */
+        {
+            volatile UBYTE *src = (volatile UBYTE *)q;
+            volatile UBYTE *dst = devBase->deviceq_after;
+            for (int i = 0; i < 48; i++) dst[i] = src[i];
         }
         break;
     }
@@ -1721,6 +1749,36 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         if (devBase->tx_scratch) {
             UBYTE *s = (UBYTE *)devBase->tx_scratch;
             for (int i = 0; i < 16; i++) ioreq->ios2_SrcAddr[i] = s[i];
+        }
+        break;
+    }
+
+    case V1000_DBG_DQBUF: {
+        /* Dump last S2_DEVICEQUERY buffer snapshot. Header goes to
+         * ios2_SrcAddr[0..15]:
+         *   [0..3]  = deviceq_call_count (BE)
+         *   [4..7]  = deviceq_sizeavailable (BE)
+         *   [8..15] = pad
+         * Then 96 bytes to caller's ios2_Data:
+         *   [0..47]  = before-write snapshot
+         *   [48..95] = after-write snapshot */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        ULONG c = devBase->deviceq_call_count;
+        ULONG s = devBase->deviceq_sizeavailable;
+        ioreq->ios2_SrcAddr[0] = (UBYTE)(c >> 24);
+        ioreq->ios2_SrcAddr[1] = (UBYTE)(c >> 16);
+        ioreq->ios2_SrcAddr[2] = (UBYTE)(c >>  8);
+        ioreq->ios2_SrcAddr[3] = (UBYTE)c;
+        ioreq->ios2_SrcAddr[4] = (UBYTE)(s >> 24);
+        ioreq->ios2_SrcAddr[5] = (UBYTE)(s >> 16);
+        ioreq->ios2_SrcAddr[6] = (UBYTE)(s >>  8);
+        ioreq->ios2_SrcAddr[7] = (UBYTE)s;
+        for (int i = 8; i < 16; i++) ioreq->ios2_SrcAddr[i] = 0;
+        if (out && ioreq->ios2_DataLength >= 96) {
+            volatile UBYTE *bsrc = devBase->deviceq_before;
+            volatile UBYTE *asrc = devBase->deviceq_after;
+            for (int i = 0; i < 48; i++) out[i]      = bsrc[i];
+            for (int i = 0; i < 48; i++) out[i + 48] = asrc[i];
         }
         break;
     }
