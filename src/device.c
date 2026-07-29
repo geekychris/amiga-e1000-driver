@@ -33,6 +33,7 @@
 #include <exec/ports.h>    /* PA_IGNORE, MsgPort init */
 
 #include <stdarg.h>
+#include <stddef.h>   /* offsetof - S2_DEVICEQUERY field-fits gates */
 
 /* Status-file path. Init appends one line per attempt; each line begins
  * with a monotonic tag so tests can grep for a specific run. Writing to
@@ -1383,35 +1384,42 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
             break;
         }
+        /* Reference implementation via kas1e/pa6t_eth's SANA-II Rev 7
+         * Ethernet driver - it uses strict offsetof gating per field,
+         * caps SizeSupplied at SizeAvailable, and never writes past
+         * caller's declared buffer. Olaf Barthel (Roadshow author)
+         * confirms this contract in his own SANA-II client:
+         *
+         *    s2dq.SizeAvailable = sizeof(s2dq) - sizeof(s2dq.RawMTU);
+         *    // "The SizeAvailable field must not suggest a larger
+         *    //  value than the driver is prepared to accept, or
+         *    //  strange things may happen."
+         *
+         * Roadshow allocates a small (24-byte) Sana2DeviceQuery for
+         * its probe pass and passes SizeAvailable to match. If we
+         * write past that, we clobber Roadshow-heap fields adjacent
+         * to the query struct - one of which is the size arg for
+         * Roadshow's post-CONFIG "alloc a receive packet" call.
+         * That's the smoking gun for the observed "Could not
+         * allocate a network packet of 0 bytes" NetLogViewer error
+         * that persisted across every S2_DEVICEQUERY field value we
+         * tried. The 0 is a real 0, not a NULL-pointer print. */
         ULONG size_full = (ULONG)sizeof(struct Sana2DeviceQuery);
-        /* Roadshow allocates a Sana2DeviceQuery struct (32+ bytes)
-         * even though it passes ios2_DataLength=24 - the DataLength
-         * is a probe hint, not the buffer size. Trust
-         * q->SizeAvailable as authoritative. Only fall back to
-         * DataLength if the caller didn't set SizeAvailable at all
-         * (some pre-Rev4 callers). Always write full struct if the
-         * declared buffer holds it - Roadshow's error "Could not
-         * allocate a network packet ... of 0 bytes" surfaced when
-         * an earlier fix capped writes at 24 and left RawMTU
-         * unwritten (Roadshow reads that field to size packet
-         * pools). */
-        ULONG buf_size = q->SizeAvailable;
-        if (buf_size == 0) buf_size = size_full;
-        ULONG size_out = (buf_size < size_full) ? buf_size : size_full;
-        q->SizeSupplied  = size_out;
-        q->DevQueryFormat = 0;    /* SANA-II Rev 7 spec: type 0 */
-        q->DeviceLevel    = 0;    /* SANA-II Rev 7 spec: level 0 */
-        q->AddrFieldSize  = 48;   /* MAC size in bits */
-        q->MTU            = 1500; /* Ethernet default */
-        q->BPS            = 100000000UL;  /* 100 Mbps */
-        q->HardwareType   = S2WireType_Ethernet;
-        q->RawMTU         = 1514; /* Ethernet frame max incl header */
-        /* Empirically confirmed (see NetLogViewer probe): Roadshow's
-         * "Could not allocate a network packet ... of 0 bytes" is
-         * unaffected by any of the fields above. The "0" is very
-         * likely a NULL pointer from a failed AllocSysObjectTags
-         * printed by Roadshow via %p, NOT a size-of-zero derived
-         * from our reply. Root cause is elsewhere. */
+        ULONG supply    = q->SizeAvailable;
+        if (supply > size_full) supply = size_full;
+        q->SizeSupplied   = supply;
+        q->DevQueryFormat = 0;
+        q->DeviceLevel    = 0;
+        if (supply >= offsetof(struct Sana2DeviceQuery, AddrFieldSize) + sizeof(UWORD))
+            q->AddrFieldSize = 48;
+        if (supply >= offsetof(struct Sana2DeviceQuery, MTU) + sizeof(ULONG))
+            q->MTU = 1500;
+        if (supply >= offsetof(struct Sana2DeviceQuery, BPS) + sizeof(ULONG))
+            q->BPS = 1000000000UL;   /* pa6t matches this - QEMU e1000 is line-rate */
+        if (supply >= offsetof(struct Sana2DeviceQuery, HardwareType) + sizeof(ULONG))
+            q->HardwareType = S2WireType_Ethernet;
+        if (supply >= offsetof(struct Sana2DeviceQuery, RawMTU) + sizeof(ULONG))
+            q->RawMTU = 1514;
         break;
     }
 
