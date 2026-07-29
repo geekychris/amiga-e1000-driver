@@ -1091,11 +1091,6 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
      * lib_OpenCnt so exec sees the unit as actively used. */
     ioreq->ios2_Req.io_Unit   = &devBase->v1000_unit;
     ioreq->ios2_Req.io_Error  = 0;
-    /* Phase 7a (per pa6t_eth): mark the message as replied so exec's
-     * queue-check logic on subsequent SendIO/DoIO sees the ioreq in a
-     * proper state. Missing this is subtle but was standard in every
-     * SANA-II reference driver we compared against. */
-    ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
     devBase->v1000_unit.unit_OpenCnt++;
     devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
 
@@ -1733,18 +1728,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* Phase 7a experiment: pa6t_eth's S2_CONFIGINTERFACE does what
-         * their S2_ONLINE does - enables the hardware AND signals
-         * S2EVENT_ONLINE. Roadshow may expect the interface to be
-         * usable immediately after CONFIGINTERFACE returns, not to
-         * require a separate S2_ONLINE call. Bring hardware up here
-         * too. Safe to call twice - S2_ONLINE checks for already-
-         * ONLINE state and is idempotent. */
-        v1000_online_hw(devBase);
-        devBase->state = V1000_STATE_ONLINE;
-        /* SANA-II §3.3: on return, ios2_SrcAddr must hold the
-         * interface's hardware address, ios2_DstAddr the broadcast
-         * hardware address. */
+        /* SANA-II §3.3 (fell through): on return, ios2_SrcAddr must
+         * hold the interface's hardware address (its own MAC) and
+         * ios2_DstAddr must hold the broadcast hardware address. This
+         * is how Roadshow discovers the device's broadcast MAC — if
+         * it's not set here, Roadshow doesn't know how to send to
+         * broadcast and quietly abandons config after this call. */
         for (int i = 0; i < 6; i++) {
             ioreq->ios2_SrcAddr[i] = devBase->mac[i];
             ioreq->ios2_DstAddr[i] = 0xFF;
