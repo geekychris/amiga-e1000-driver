@@ -152,6 +152,15 @@ struct Virte1000Base
     volatile UBYTE      deviceq_before[48];
     volatile UBYTE      deviceq_after[48];
 
+    /* Same-shape snapshot for S2_CONFIGINTERFACE. Snapshots the raw
+     * IOSana2Req bytes from offset 0 (io_Message.mn_Node) through
+     * offset 79 (well past ios2_DstAddr[]). Roadshow's alloc(0)
+     * failure might be triggered by something in this ioreq we
+     * haven't looked at. */
+    volatile ULONG      config_call_count;
+    volatile UBYTE      config_before[80];
+    volatile UBYTE      config_after[80];
+
     /* Phase 7a diagnostic ring: last 32 BeginIO commands so a test can
      * see what Roadshow actually issued when a bind fails. Compact
      * per-entry format; V1000_DBG_CMDLOG dumps 32 x 40 bytes. */
@@ -246,5 +255,11 @@ struct V1000Opener
                                      *   ios2_Data[0..47]   = before
                                      *   ios2_Data[48..95]  = after
                                      * Caller supplies >=96-byte buf. */
+#define V1000_DBG_CFGBUF   0xF008   /* Dump the last S2_CONFIGINTERFACE
+                                     * ioreq snapshot. Header in
+                                     * ios2_SrcAddr[0..7] = call_count.
+                                     * ios2_Data[0..79]  = before
+                                     * ios2_Data[80..159] = after
+                                     * Caller supplies >=160-byte buf. */
 
 #endif

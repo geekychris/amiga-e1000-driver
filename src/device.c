@@ -1753,6 +1753,24 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
     }
 
+    case V1000_DBG_CFGBUF: {
+        /* Dump last S2_CONFIGINTERFACE ioreq snapshot. */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        ULONG c = devBase->config_call_count;
+        ioreq->ios2_SrcAddr[0] = (UBYTE)(c >> 24);
+        ioreq->ios2_SrcAddr[1] = (UBYTE)(c >> 16);
+        ioreq->ios2_SrcAddr[2] = (UBYTE)(c >>  8);
+        ioreq->ios2_SrcAddr[3] = (UBYTE)c;
+        for (int i = 4; i < 16; i++) ioreq->ios2_SrcAddr[i] = 0;
+        if (out && ioreq->ios2_DataLength >= 160) {
+            volatile UBYTE *bsrc = devBase->config_before;
+            volatile UBYTE *asrc = devBase->config_after;
+            for (int i = 0; i < 80; i++) out[i]      = bsrc[i];
+            for (int i = 0; i < 80; i++) out[i + 80] = asrc[i];
+        }
+        break;
+    }
+
     case V1000_DBG_DQBUF: {
         /* Dump last S2_DEVICEQUERY buffer snapshot. Header goes to
          * ios2_SrcAddr[0..15]:
@@ -1802,15 +1820,18 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
 
     case S2_CONFIGINTERFACE: {
         /* SANA-II-NOTES §3.3: caller sets ios2_SrcAddr = MAC to program;
-         * all-zeros means "use factory".
-         *
-         * Phase 7a: Roadshow calls S2_CONFIGINTERFACE TWICE at bind time
-         * (once to probe, once to actually configure — cmdlog trace
-         * proved this). Under the strict "only from OFFLINE" reading of
-         * the spec, the second call returned S2ERR_BAD_STATE and made
-         * Roadshow report "No buffer space available" for the whole
-         * add. Real drivers (rtl8139.device etc.) accept the second call
-         * idempotently as long as no MAC change is requested. */
+         * all-zeros means "use factory". */
+        /* Phase 7a diagnostic: snapshot the WHOLE ioreq before we
+         * write anything, so DBG_CFGBUF can dump every field. Roadshow
+         * might set some non-obvious field that steers post-CONFIG
+         * pool sizing. */
+        devBase->config_call_count++;
+        {
+            volatile UBYTE *src = (volatile UBYTE *)ioreq;
+            volatile UBYTE *dst = devBase->config_before;
+            for (int i = 0; i < 80; i++) dst[i] = src[i];
+        }
+
         BOOL want_factory = TRUE;
         for (int i = 0; i < 6; i++)
             if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
@@ -1847,6 +1868,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                 ioreq->ios2_SrcAddr[i] = devBase->mac[i];
                 ioreq->ios2_DstAddr[i] = 0xFF;
             }
+            /* Phase 7a diagnostic AFTER snapshot (idempotent path). */
+            {
+                volatile UBYTE *src = (volatile UBYTE *)ioreq;
+                volatile UBYTE *dst = devBase->config_after;
+                for (int i = 0; i < 80; i++) dst[i] = src[i];
+            }
             break;
         }
         if (!want_factory) {
@@ -1864,6 +1891,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         for (int i = 0; i < 6; i++) {
             ioreq->ios2_SrcAddr[i] = devBase->mac[i];
             ioreq->ios2_DstAddr[i] = 0xFF;
+        }
+        /* Phase 7a diagnostic AFTER snapshot. */
+        {
+            volatile UBYTE *src = (volatile UBYTE *)ioreq;
+            volatile UBYTE *dst = devBase->config_after;
+            for (int i = 0; i < 80; i++) dst[i] = src[i];
         }
         break;
     }
