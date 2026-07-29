@@ -1037,26 +1037,6 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
          task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
          devBase->unit_task, (ULONG)devBase->unit_signal_mask);
 
-    /* Phase 7a experiment: retro-upgrade v1000_unit's MsgPort from
-     * PA_IGNORE (set earlier in Init) to PA_SIGNAL with our now-
-     * started unit_task. Some allocators (possibly Roadshow's
-     * AllocSysObjectTags path around ASOT_MESSAGE) may validate that
-     * a unit's port has a real SigTask before allocating attached
-     * messages/requests. Roadshow's "Could not allocate a network
-     * packet ... of 0 bytes" (NULL from AllocSysObjectTags) is
-     * plausibly this. Falls back to PA_IGNORE if task setup failed. */
-    if (task_ok && devBase->unit_task && devBase->unit_signal_mask) {
-        struct Unit *u = &devBase->v1000_unit;
-        int8 bit = 0;
-        ULONG m = devBase->unit_signal_mask;
-        while (m && !(m & 1)) { m >>= 1; bit++; }
-        u->unit_MsgPort.mp_Flags   = PA_SIGNAL;
-        u->unit_MsgPort.mp_SigBit  = bit;
-        u->unit_MsgPort.mp_SigTask = devBase->unit_task;
-        LOGF(log, (CONST_STRPTR)"unit port: upgraded to PA_SIGNAL (bit=%ld task=%p)\n",
-             (long)bit, devBase->unit_task);
-    }
-
     /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
      * S2_ONLINE (or the debug V1000_DBG_FIRE_IRQ, once online) to make
      * the device live. */
