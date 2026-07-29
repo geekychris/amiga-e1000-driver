@@ -15,9 +15,12 @@
 #include <proto/exec.h>
 
 #define SHUNT_NAME       "sanashunt.device"
-#define SHUNT_VER        1
-#define SHUNT_REV        0
-#define SHUNT_VERSTRING  "sanashunt.device 1.0 (Roadshow trace proxy) " __DATE__
+#define SHUNT_VER        0    /* Matches virte1000's DEVVER; kernel appears
+                               * to reject Init on non-zero versions - see
+                               * shunt.c Init comment. Real revision is
+                               * tracked in SHUNT_REV / verstag. */
+#define SHUNT_REV        1
+#define SHUNT_VERSTRING  "sanashunt.device 0.1 (Roadshow trace proxy) " __DATE__
 
 #define SHUNT_BACKEND_DEVICE "rtl8139.device"
 #define SHUNT_BACKEND_UNIT   0

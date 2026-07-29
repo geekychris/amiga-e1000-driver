@@ -38,11 +38,13 @@
 #include <dos/dosextens.h>
 #include <interfaces/dos.h>
 
-/* File-based Init log - persistent per-line append. First call opens
- * with MODE_NEWFILE (truncates), subsequent calls append via
- * MODE_READWRITE + seek end. Written pattern mirrors what virte1000
- * does and works there. */
-static BOOL shunt_log_first = TRUE;
+/* File-based Init log. IMPORTANT: this function must NOT declare any
+ * mutable statics of its own — anything with a runtime initializer
+ * lands in .data BEFORE dev_res, which pushes the resident tag off
+ * the 4-byte alignment OS4's ResidentScan expects. That silently
+ * breaks AutoInit (`version` still sees the tag string but the
+ * kernel never invokes _manager_Init). Every call opens the file
+ * afresh in MODE_READWRITE + seek-end so multiple lines accumulate. */
 static void shunt_init_log(struct ExecIFace *IExec, const char *line)
 {
     struct Library *DOSBase = IExec->OpenLibrary((CONST_STRPTR)"dos.library", 51);
@@ -50,15 +52,10 @@ static void shunt_init_log(struct ExecIFace *IExec, const char *line)
     struct DOSIFace *IDOS = (struct DOSIFace *)
         IExec->GetInterface(DOSBase, (CONST_STRPTR)"main", 1, NULL);
     if (IDOS) {
-        BPTR fh;
-        if (shunt_log_first) {
-            fh = IDOS->Open((CONST_STRPTR)"RAM:sanashunt-init.log", MODE_NEWFILE);
-            shunt_log_first = FALSE;
-        } else {
-            fh = IDOS->Open((CONST_STRPTR)"RAM:sanashunt-init.log", MODE_READWRITE);
-            if (fh) IDOS->ChangeFilePosition(fh, 0, OFFSET_END);
-        }
+        BPTR fh = IDOS->Open((CONST_STRPTR)"RAM:sanashunt-init.log", MODE_READWRITE);
+        if (!fh) fh = IDOS->Open((CONST_STRPTR)"RAM:sanashunt-init.log", MODE_NEWFILE);
         if (fh) {
+            IDOS->ChangeFilePosition(fh, 0, OFFSET_END);
             IDOS->FPuts(fh, (CONST_STRPTR)line);
             IDOS->FPuts(fh, (CONST_STRPTR)"\n");
             IDOS->Close(fh);
