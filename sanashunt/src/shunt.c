@@ -156,15 +156,25 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
     return 20;
 }
 
-/* ---------- Init: open backend rtl8139.device ---------- */
+/* ---------- Init: STRIPPED TO MINIMUM for shunt-bootstrap debugging.
+ * If Open succeeds with this, our Init body is the problem. If Open
+ * still returns -1, resident tag / kernel wiring is the problem. */
 struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Interface *exec)
+{
+    (void)seglist; (void)exec;
+    struct SanaShuntBase *base = (struct SanaShuntBase *)library;
+    struct ExecIFace *IExec = (struct ExecIFace *)exec;
+
+    shunt_init_log(IExec, "MINIMAL Init entered");
+    return library;
+}
+
+/* Full Init disabled during debug — see above. */
+struct Library *_manager_Init_full(struct Library *library, BPTR seglist, struct Interface *exec)
 {
     struct SanaShuntBase *base = (struct SanaShuntBase *)library;
     struct ExecIFace *IExec = (struct ExecIFace *)exec;
 
-    /* Log BEFORE touching anything else, so we can tell if we get here
-     * at all. Previously nothing appeared in the log file — either
-     * kernel isn't calling Init, or something below crashes silently. */
     shunt_init_log(IExec, "Init entered");
     IExec->DebugPrintF("[sanashunt] Init: " SHUNT_VERSTRING "\n");
     shunt_init_log(IExec, "Init: past DebugPrintF");
