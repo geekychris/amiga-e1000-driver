@@ -1378,12 +1378,13 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * we fill in the OUT fields and set SizeSupplied. Values
          * hardcoded for a QEMU-emulated 82540EM — BPS reports 1 Gbps
          * because QEMU never negotiates below max. */
-        struct Sana2DeviceQuery *q = (struct Sana2DeviceQuery *)ioreq->ios2_Data;
-        /* Note: spec places the struct pointer in ios2_StatData per §3.1,
-         * but historic drivers accept it in ios2_Data too because
-         * Roadshow has been observed to set both. We honor ios2_Data
-         * first; if NULL, fall back to ios2_StatData. */
-        if (!q) q = (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
+        /* SANA-II Rev 7 spec §3.1 puts the query struct pointer in
+         * ios2_StatData. pa6t_eth reads only from StatData. But some
+         * callers (older SANA-II clients) put it in ios2_Data. Try
+         * StatData first (spec-correct), fall back to Data (compat).
+         * Only fail if both are NULL. */
+        struct Sana2DeviceQuery *q = (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
+        if (!q) q = (struct Sana2DeviceQuery *)ioreq->ios2_Data;
         if (!q) {
             ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
             ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
@@ -1733,15 +1734,15 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* Phase 7a experiment: pa6t_eth's S2_CONFIGINTERFACE does what
-         * their S2_ONLINE does - enables the hardware AND signals
-         * S2EVENT_ONLINE. Roadshow may expect the interface to be
-         * usable immediately after CONFIGINTERFACE returns, not to
-         * require a separate S2_ONLINE call. Bring hardware up here
-         * too. Safe to call twice - S2_ONLINE checks for already-
-         * ONLINE state and is idempotent. */
-        v1000_online_hw(devBase);
-        devBase->state = V1000_STATE_ONLINE;
+        /* REVERTED (was: also call v1000_online_hw here). That change
+         * enabled IRQs mid-way through Roadshow's bind, triggering a
+         * DSI crash in Roadshow's AddNetInterface task at 0x01855a0c
+         * with a parsed reply of "(5, 10193, Bad address, Unknown
+         * SANA-II wire error 10193)". io_Error=5 = S2ERR_BAD_ADDRESS
+         * which we never set - value came from corrupted stack after
+         * Roadshow's crash. Reverting to spec-strict transition:
+         * CONFIGINTERFACE promotes to CONFIGURED only; caller must
+         * S2_ONLINE separately. */
         /* SANA-II §3.3: on return, ios2_SrcAddr must hold the
          * interface's hardware address, ios2_DstAddr the broadcast
          * hardware address. */
