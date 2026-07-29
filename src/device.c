@@ -1366,27 +1366,44 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         ULONG size_full = (ULONG)sizeof(struct Sana2DeviceQuery);
         /* Cap by whichever of q->SizeAvailable / ios2_DataLength is
          * non-zero. Roadshow observed to pass len=24 in ios2_DataLength
-         * without setting q->SizeAvailable — our old code then wrote 0
-         * bytes (size_out = min(0, 32) = 0), and Roadshow read
-         * SizeSupplied=0 as "driver query failed". */
+         * without setting q->SizeAvailable. */
         ULONG buf_size = q->SizeAvailable;
         if (buf_size == 0) buf_size = ioreq->ios2_DataLength;
-        if (buf_size == 0) buf_size = size_full;   /* last-resort default */
+        if (buf_size == 0) buf_size = size_full;
         ULONG size_out = (buf_size < size_full) ? buf_size : size_full;
         q->SizeSupplied  = size_out;
-        q->DevQueryFormat = 0;
-        q->DeviceLevel    = 0;
-        q->AddrFieldSize  = 48;
-        q->MTU            = 1500;
-        /* BPS: report 100 Mbps rather than 1 Gbps. QEMU's e1000 model
-         * always says "link UP full duplex 1000Mb" via STATUS, but
-         * Roadshow may pre-allocate scaled buffer pools based on BPS;
-         * 1G is a well-known ceiling that trips old TCP/IP stacks.
-         * 100Mbps is well-inside every stack's comfort zone and still
-         * accurate to what QEMU's user-mode NAT actually delivers. */
-        q->BPS            = 100000000UL;
-        q->HardwareType   = S2WireType_Ethernet;
-        q->RawMTU         = 1514;
+
+        /* CRITICAL: only write fields that fit within size_out. The
+         * old version wrote EVERY field (SizeSupplied .. RawMTU)
+         * unconditionally, which overran Roadshow's 24-byte buffer
+         * and corrupted heap memory adjacent to it. The observed
+         * downstream symptom was "could not allocate request for
+         * interface virte1000" in NetLogViewer — Roadshow's per-
+         * interface IORequest pool allocation, sitting in freshly-
+         * clobbered heap, blew up. Cascading failure from a plain
+         * silent buffer overrun. Guard every field on offsetof. */
+        #define WRITE_IF_FITS(field) \
+            do { if (size_out >= (ULONG)(sizeof(*q) - ((ULONG)(char *)&(((struct Sana2DeviceQuery *)0)->field + 1) - (ULONG)(char *)&(((struct Sana2DeviceQuery *)0)->field))) \
+                    && ((ULONG)((char *)&q->field - (char *)q) + sizeof(q->field)) <= size_out) \
+                    q->field = q->field; } while (0)
+        /* Simpler formulation: precompute each field's offset+size and
+         * write only when the end of that field fits within size_out. */
+        if ((ULONG)((char *)&q->DevQueryFormat - (char *)q) + sizeof(q->DevQueryFormat) <= size_out)
+            q->DevQueryFormat = 0;
+        if ((ULONG)((char *)&q->DeviceLevel - (char *)q) + sizeof(q->DeviceLevel) <= size_out)
+            q->DeviceLevel = 0;
+        if ((ULONG)((char *)&q->AddrFieldSize - (char *)q) + sizeof(q->AddrFieldSize) <= size_out)
+            q->AddrFieldSize = 48;
+        if ((ULONG)((char *)&q->MTU - (char *)q) + sizeof(q->MTU) <= size_out)
+            q->MTU = 1500;
+        /* BPS: 100 Mbps (see BPS commit). */
+        if ((ULONG)((char *)&q->BPS - (char *)q) + sizeof(q->BPS) <= size_out)
+            q->BPS = 100000000UL;
+        if ((ULONG)((char *)&q->HardwareType - (char *)q) + sizeof(q->HardwareType) <= size_out)
+            q->HardwareType = S2WireType_Ethernet;
+        if ((ULONG)((char *)&q->RawMTU - (char *)q) + sizeof(q->RawMTU) <= size_out)
+            q->RawMTU = 1514;
+        #undef WRITE_IF_FITS
         break;
     }
 
