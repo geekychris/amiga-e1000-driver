@@ -1103,6 +1103,13 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
      * lib_OpenCnt so exec sees the unit as actively used. */
     ioreq->ios2_Req.io_Unit   = &devBase->v1000_unit;
     ioreq->ios2_Req.io_Error  = 0;
+    /* Phase 7a (per pa6t_eth): mark the message as replied so exec's
+     * subsequent SendIO/DoIO on this ioreq sees the reply-state and
+     * short-circuits any pending-queue check. pa6t sets this ONLY on
+     * Open success. An earlier commit bundled this with a crashy
+     * auto-online-in-CONFIGINTERFACE change; that was reverted, but
+     * the NT_REPLYMSG line went with it. Re-adding it in isolation. */
+    ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
     devBase->v1000_unit.unit_OpenCnt++;
     devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
 
@@ -1732,12 +1739,22 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                     break;
                 }
             }
-            /* Phase 7a (per pa6t_eth): don't touch ios2_SrcAddr /
-             * ios2_DstAddr on reply. pa6t's CONFIGINTERFACE handler
-             * only sets io_Error/WireError to 0 and replies. Writing
-             * SrcAddr on the reply may confuse Roadshow if it saved
-             * a different desired MAC in that field as INPUT and
-             * doesn't want the driver rewriting it. */
+            /* Phase 7a: MUST write ios2_SrcAddr = station MAC on the
+             * reply. Roadshow's DEBUG=YES output "hardware address =
+             * 00:00:00:00:00:00" proved that Roadshow reads SrcAddr
+             * from CONFIGINTERFACE reply and stores it as the
+             * interface MAC. Not writing left zero → Roadshow
+             * couldn't build valid Ethernet headers.
+             *
+             * pa6t_eth "works" without this because pa6t queues
+             * CONFIGINTERFACE to a task and only sets io_Error/
+             * WireError; but pa6t's Roadshow-side interface config
+             * has DHCP=YES, and the DHCP client separately calls
+             * S2_GETSTATIONADDRESS. Our static-IP flow may not. */
+            for (int i = 0; i < 6; i++) {
+                ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+                ioreq->ios2_DstAddr[i] = 0xFF;
+            }
             break;
         }
         if (!want_factory) {
@@ -1748,13 +1765,14 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* Phase 7a (per pa6t_eth): don't touch ios2_SrcAddr or DstAddr
-         * on reply - only set io_Error and WireError to 0 (already
-         * done at BeginIO entry). If Roadshow needs the station
-         * address it calls S2_GETSTATIONADDRESS separately. Prior
-         * "read broadcast MAC from CONFIGINTERFACE reply" theory was
-         * wrong; Roadshow was quietly abandoning bind for other
-         * reasons. */
+        /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
+         * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
+         * interface hardware address. Must set it here. Also fill
+         * DstAddr with broadcast per SANA-II §3.3. */
+        for (int i = 0; i < 6; i++) {
+            ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+            ioreq->ios2_DstAddr[i] = 0xFF;
+        }
         break;
     }
 
