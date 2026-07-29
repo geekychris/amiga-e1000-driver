@@ -1732,14 +1732,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                     break;
                 }
             }
-            /* Same MAC (or factory) — success, no state change. Still
-             * fill in SrcAddr/DstAddr per SANA-II §3.3, since Roadshow
-             * reads these on every CONFIGINTERFACE reply, not just the
-             * first. */
-            for (int i = 0; i < 6; i++) {
-                ioreq->ios2_SrcAddr[i] = devBase->mac[i];
-                ioreq->ios2_DstAddr[i] = 0xFF;
-            }
+            /* Phase 7a (per pa6t_eth): don't touch ios2_SrcAddr /
+             * ios2_DstAddr on reply. pa6t's CONFIGINTERFACE handler
+             * only sets io_Error/WireError to 0 and replies. Writing
+             * SrcAddr on the reply may confuse Roadshow if it saved
+             * a different desired MAC in that field as INPUT and
+             * doesn't want the driver rewriting it. */
             break;
         }
         if (!want_factory) {
@@ -1750,16 +1748,13 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* SANA-II §3.3 (fell through): on return, ios2_SrcAddr must
-         * hold the interface's hardware address (its own MAC) and
-         * ios2_DstAddr must hold the broadcast hardware address. This
-         * is how Roadshow discovers the device's broadcast MAC — if
-         * it's not set here, Roadshow doesn't know how to send to
-         * broadcast and quietly abandons config after this call. */
-        for (int i = 0; i < 6; i++) {
-            ioreq->ios2_SrcAddr[i] = devBase->mac[i];
-            ioreq->ios2_DstAddr[i] = 0xFF;
-        }
+        /* Phase 7a (per pa6t_eth): don't touch ios2_SrcAddr or DstAddr
+         * on reply - only set io_Error and WireError to 0 (already
+         * done at BeginIO entry). If Roadshow needs the station
+         * address it calls S2_GETSTATIONADDRESS separately. Prior
+         * "read broadcast MAC from CONFIGINTERFACE reply" theory was
+         * wrong; Roadshow was quietly abandoning bind for other
+         * reasons. */
         break;
     }
 
