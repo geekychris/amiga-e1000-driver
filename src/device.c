@@ -348,6 +348,38 @@ static struct V1000Opener *v1000_find_opener(struct Virte1000Base *base,
     return NULL;
 }
 
+/* Walk every opener's event_queue; for each request whose
+ * ios2_WireError (caller-set mask) intersects event_mask, remove
+ * from queue, set WireError to the matched bits, and ReplyMsg.
+ * Called from S2_ONLINE / S2_OFFLINE handlers on state transitions.
+ * Mirrors pa6t_eth's signal_event() but per-opener queue rather
+ * than per-driver event_list. */
+static void v1000_signal_event(struct Virte1000Base *base, ULONG event_mask)
+{
+    struct ExecIFace *IExec = base->IExec;
+    IExec->ObtainSemaphore(&base->opener_lock);
+    struct V1000Opener *op;
+    for (op = (struct V1000Opener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ;
+         op = (struct V1000Opener *)op->node.mln_Succ) {
+        struct MinNode *n = op->event_queue.mlh_Head, *next;
+        while ((next = n->mln_Succ) != NULL) {
+            /* Node is at offset 0 of IOSana2Req - direct cast. */
+            struct IOSana2Req *r = (struct IOSana2Req *)n;
+            ULONG mask = r->ios2_WireError;
+            ULONG match = mask & event_mask;
+            if (match) {
+                IExec->Remove((struct Node *)n);
+                r->ios2_WireError    = match;
+                r->ios2_Req.io_Error = 0;
+                IExec->ReplyMsg((struct Message *)r);
+            }
+            n = next;
+        }
+    }
+    IExec->ReleaseSemaphore(&base->opener_lock);
+}
+
 /* Resolve a CPU-virtual allocation to its PCI-bus physical address
  * via the OS4-blessed StartDMA + GetDMAList path (pa6t_eth pattern).
  * Returns 0 on failure. Caller should have kept the allocation in the
@@ -1132,6 +1164,7 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
         }
         op->bm_cookie = ioreq->ios2_BufferManagement;   /* the tag list */
         devBase->IExec->NewList((struct List *)&op->read_queue);
+        devBase->IExec->NewList((struct List *)&op->event_queue);
         devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
         devBase->IExec->AddTail((struct List *)&devBase->opener_list,
                                  (struct Node *)&op->node);
@@ -1177,6 +1210,15 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
             struct Node *node;
             while ((node = IExec->RemHead(
                         (struct List *)&found->read_queue)) != NULL) {
+                struct IOSana2Req *pending = (struct IOSana2Req *)node;
+                pending->ios2_Req.io_Error = IOERR_ABORTED;
+                IExec->ReplyMsg((struct Message *)pending);
+            }
+            /* Phase 7a: drain event_queue too — S2_ONEVENT requests
+             * that never fired need to be replied to before we free
+             * the opener, else the caller's WaitIO deadlocks. */
+            while ((node = IExec->RemHead(
+                        (struct List *)&found->event_queue)) != NULL) {
                 struct IOSana2Req *pending = (struct IOSana2Req *)node;
                 pending->ios2_Req.io_Error = IOERR_ABORTED;
                 IExec->ReplyMsg((struct Message *)pending);
@@ -1735,6 +1777,10 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         }
         v1000_online_hw(devBase);
         devBase->state = V1000_STATE_ONLINE;
+        /* Phase 7a: reply any queued S2_ONEVENT requests waiting for
+         * S2EVENT_ONLINE. pa6t_eth signals this from its unit task
+         * on the same state transition. */
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
         break;
     }
 
@@ -1746,8 +1792,9 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
             v1000_offline_hw(devBase);
             devBase->state = V1000_STATE_CONFIGURED;
         }
-        /* Phase 6c will: reply all pending IO requests with S2ERR_OUTOFSERVICE
-         * and signal S2EVENT_OFFLINE to ONEVENT queues. Nothing queued yet. */
+        /* Phase 7a: reply any queued S2_ONEVENT requests waiting for
+         * S2EVENT_OFFLINE. */
+        v1000_signal_event(devBase, S2EVENT_OFFLINE);
         break;
     }
 
@@ -1988,21 +2035,49 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         break;
 
     case S2_ONEVENT: {
-        /* SANA-II event notification. Real drivers queue the request
-         * and reply when a subscribed event fires (S2EVENT_ONLINE etc).
-         * Phase 7a: if the caller is subscribing to an event whose
-         * current state is already true, reply immediately with the
-         * event mask; otherwise reply with success but empty mask.
-         * This is enough for Roadshow to proceed — it subscribes to
-         * S2EVENT_ONLINE at bind time, and we're ONLINE by then. */
-        ULONG mask = ioreq->ios2_WireError;   /* caller-supplied event mask */
+        /* SANA-II event notification. Real drivers (pa6t_eth, etc.)
+         * QUEUE the request and reply when a matching event fires
+         * via v1000_signal_event() below. Roadshow subscribes to
+         * S2EVENT_ONLINE at bind time and expects that request to
+         * stay pending until CONFIGINTERFACE / ONLINE actually
+         * brings the interface online - our earlier reply-immediately
+         * pattern likely broke Roadshow's post-bind alloc.
+         *
+         * Two cases:
+         *   1. The event mask matches CURRENT state -> reply now
+         *      (Roadshow calls S2_ONEVENT AFTER ONLINE; matches
+         *      immediately; no need to queue).
+         *   2. Otherwise -> queue on opener's event_queue; wait for
+         *      state transition to fire v1000_signal_event(). */
+        ULONG mask = ioreq->ios2_WireError;
         ULONG match = 0;
-        if ((mask & S2EVENT_ONLINE)  && devBase->state == V1000_STATE_ONLINE)  match |= S2EVENT_ONLINE;
-        if ((mask & S2EVENT_OFFLINE) && devBase->state != V1000_STATE_ONLINE)  match |= S2EVENT_OFFLINE;
-        ioreq->ios2_WireError = match ? match : mask;
-        /* io_Error stays 0 — event either matched or the caller can
-         * inspect WireError. Not queuing yet; Roadshow tolerates this
-         * pattern in existing drivers (rtl8139.device, etc). */
+        if ((mask & S2EVENT_ONLINE)  && devBase->state == V1000_STATE_ONLINE)   match |= S2EVENT_ONLINE;
+        if ((mask & S2EVENT_OFFLINE) && devBase->state != V1000_STATE_ONLINE)   match |= S2EVENT_OFFLINE;
+        if (match) {
+            ioreq->ios2_WireError = match;
+            break;   /* reply immediately with the matched mask */
+        }
+        /* No match yet — queue this request. Requires an opener to
+         * enqueue on. Fall back to immediate-reply if we can't find
+         * an opener (defensive). */
+        struct V1000Opener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
+        } else {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+        }
+        if (op) {
+            ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+            ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+            IExec->AddTail((struct List *)&op->event_queue,
+                           (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+            return;   /* pending — no ReplyMsg */
+        }
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+        /* No opener — reply with empty mask, io_Error=0. */
+        ioreq->ios2_WireError = 0;
         break;
     }
 
@@ -2074,7 +2149,19 @@ LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     for (op = (struct V1000Opener *)base->opener_list.mlh_Head;
          op->node.mln_Succ && !found;
          op = (struct V1000Opener *)op->node.mln_Succ) {
+        /* Check read_queue first. */
         for (node = op->read_queue.mlh_Head;
+             (next = node->mln_Succ) != NULL;
+             node = next) {
+            if ((APTR)node == (APTR)&ioreq->ios2_Req.io_Message.mn_Node) {
+                IExec->Remove((struct Node *)node);
+                found = TRUE;
+                break;
+            }
+        }
+        if (found) break;
+        /* Then event_queue (Phase 7a: S2_ONEVENT is queued). */
+        for (node = op->event_queue.mlh_Head;
              (next = node->mln_Succ) != NULL;
              node = next) {
             if ((APTR)node == (APTR)&ioreq->ios2_Req.io_Message.mn_Node) {

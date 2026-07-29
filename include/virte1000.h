@@ -176,6 +176,16 @@ struct V1000Opener
      * BeginIO enqueues, unit task dequeues + delivers via CopyToBuff.
      * IORequest's io_Message.mn_Node fits as-is on this list. */
     struct MinList  read_queue;
+
+    /* Phase 7a: queue of S2_ONEVENT requests waiting for a specific
+     * event mask. Each entry's ios2_WireError holds the caller's
+     * requested event mask (S2EVENT_ONLINE etc.). BeginIO adds;
+     * v1000_signal_event() walks + replies matching entries when the
+     * corresponding state transition fires (S2_ONLINE / S2_OFFLINE).
+     * Roadshow subscribes to S2EVENT_ONLINE at bind time and expects
+     * that request to stay pending until the interface actually goes
+     * online — earlier immediate-success reply broke its bind flow. */
+    struct MinList  event_queue;
 };
 
 /* Unit-state values held in Virte1000Base.state. Defined as constants
