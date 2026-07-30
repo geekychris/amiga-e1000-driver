@@ -1908,6 +1908,37 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
+        /* PHASE 7o GDB SESSION FINDING: found interpreter function
+         * entry at 0x018559b0 (takes r3=input-ptr, r4=obj-with-tables).
+         *   r5 = *(r4+0)     — state table base
+         *   r30 = *(r4+8)    — some pointer
+         *   r28 = *(r4+0x14) — handler table base
+         *   r8 = r3 (initial input pointer) then walks the bytecode
+         *
+         * Interpreter loop body (0x01855a0c onwards) reads halfword
+         * tokens, indexes state table, dispatches handlers, uses
+         * coroutine-style pattern (r22->0x1c saves/restores stack).
+         * Later code (0x01855aa4-e4) makes a system call at address
+         * 0x018138ec via `sc` instruction.
+         *
+         * Preceding sibling functions at 0x01855900, 0x01855944:
+         * virtual dispatch via r->0x2e8 (a vtable offset) — classic
+         * OO pattern.
+         *
+         * NOT identified yet: what library this is (unusual VMA of
+         * 0x0185xxxx is beyond bsdsocket .text end 0x01054414, so
+         * likely a different library relocated high). Candidates
+         * based on the pattern:
+         *   - dos.library MatchPattern (bytecode wildcard matcher)
+         *   - rexxsyslib.library (ARexx interpreter)
+         *   - Roadshow's own IP config expression parser
+         *
+         * The 0x018559b0 function's caller (via bl or bctrl) would
+         * reveal the context. Search log for LR value 0x018559b4 to
+         * find who calls in. Or set gdb.sh break *0x018559b0 and
+         * dump r3/r4 on hit — that tells us the input stream + object.
+         */
+#if 0
         /* PHASE 7n GDB SESSION FINDING: caught real disassembly at
          * 0x01855a0c via QEMU monitor `x/16i 0x01855a0c`. Code is a
          * bytecode/DFA interpreter loop:
@@ -1928,6 +1959,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * where r8 initially points. Likely a Roadshow-internal
          * parser (regex/DFA for something — DNS names? config? IP
          * expression?) invoked once state=ONLINE lets it run. */
+#endif
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
