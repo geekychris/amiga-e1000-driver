@@ -1402,12 +1402,20 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * we fill in the OUT fields and set SizeSupplied. Values
          * hardcoded for a QEMU-emulated 82540EM — BPS reports 1 Gbps
          * because QEMU never negotiates below max. */
-        struct Sana2DeviceQuery *q = (struct Sana2DeviceQuery *)ioreq->ios2_Data;
-        /* Note: spec places the struct pointer in ios2_StatData per §3.1,
-         * but historic drivers accept it in ios2_Data too because
-         * Roadshow has been observed to set both. We honor ios2_Data
-         * first; if NULL, fall back to ios2_StatData. */
-        if (!q) q = (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
+        /* SANA-II Rev 4 §3.1: the Sana2DeviceQuery struct is passed in
+         * ios2_StatData. Roadshow follows the spec strictly — ios2_Data
+         * contains a stale pointer from prior request reuse (cmdlog
+         * consistently shows data=0x6EDExxxx with len=24 — that's a
+         * DIFFERENT buffer, not our query struct).
+         *
+         * PRIOR BUG: we read ios2_Data first, then StatData as fallback.
+         * That wrote our MTU/HW/BPS values into the wrong buffer.
+         * Roadshow's real query struct stayed all-zero, so
+         * QueryInterfaceTagList reported MTU=0 / HardwareType=0 and
+         * ConfigureNetInterface UP failed with ENOBUFS because
+         * request-alloc size = 0 + overhead. */
+        struct Sana2DeviceQuery *q = (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
+        if (!q) q = (struct Sana2DeviceQuery *)ioreq->ios2_Data;
         if (!q) {
             ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
             ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
@@ -1483,28 +1491,19 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * there) - the "Could not allocate a network packet of 0
          * bytes" mystery. Write the fields at BOTH plausible offsets
          * to cover both compile ABIs. */
-        UBYTE *raw = (UBYTE *)q;
-        /* Offsets in a "no-pack" ABI (with 2-byte pad after AddrFieldSize) */
-        ULONG alt_MTU        = 20;
-        ULONG alt_BPS        = 24;
-        ULONG alt_HW         = 28;
-        ULONG alt_RawMTU     = 32;
-        if (supply >= alt_MTU + 4) {
-            raw[alt_MTU + 0] = 0x00; raw[alt_MTU + 1] = 0x00;
-            raw[alt_MTU + 2] = 0x05; raw[alt_MTU + 3] = 0xDC;   /* 1500 BE */
-        }
-        if (supply >= alt_BPS + 4) {
-            raw[alt_BPS + 0] = 0x3B; raw[alt_BPS + 1] = 0x9A;
-            raw[alt_BPS + 2] = 0xCA; raw[alt_BPS + 3] = 0x00;   /* 1G */
-        }
-        if (supply >= alt_HW + 4) {
-            raw[alt_HW + 0] = 0x00; raw[alt_HW + 1] = 0x00;
-            raw[alt_HW + 2] = 0x00; raw[alt_HW + 3] = 0x01;     /* Ethernet */
-        }
-        if (supply >= alt_RawMTU + 4) {
-            raw[alt_RawMTU + 0] = 0x00; raw[alt_RawMTU + 1] = 0x00;
-            raw[alt_RawMTU + 2] = 0x05; raw[alt_RawMTU + 3] = 0xEA;  /* 1514 */
-        }
+        /* PHASE 7c FIX: after switching to ios2_StatData (spec-correct),
+         * HardwareType came through as Ethernet=1 (verified via
+         * QueryInterfaceTagList) — proving bsdsocket uses natural PPC
+         * alignment for the Sana2DeviceQuery struct (HardwareType at
+         * offset 28, MTU at offset 20). The natural `q->MTU = 1500`
+         * write above lands at the right offset — no shotgun needed.
+         *
+         * bsdsocket allocates the query struct as sizeof(struct
+         * Sana2DeviceQuery) = 36 bytes even though it passes
+         * ios2_DataLength = 24 for the pre-Rev-7 subset. Writes past
+         * offset 24 land in valid struct memory (28 = HardwareType,
+         * 32 = RawMTU) — that's why HardwareType came through. Same
+         * applies to MTU. No additional writes needed. */
         /* Phase 7a diagnostic AFTER snapshot. */
         {
             volatile UBYTE *src = (volatile UBYTE *)q;
