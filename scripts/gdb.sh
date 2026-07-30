@@ -13,6 +13,9 @@
 #   ./scripts/gdb.sh break <addr>      # break at PC, continue, dump on hit
 #   ./scripts/gdb.sh script <file>     # run arbitrary GDB script from host path
 #   ./scripts/gdb.sh raw '<cmds>'      # run arbitrary GDB commands inline
+#   ./scripts/gdb.sh mon '<cmd>'       # QEMU monitor cmd (needs -monitor tcp::4444)
+#   ./scripts/gdb.sh disasm <addr> [n] # disassemble n=16 insns at addr via monitor
+#   ./scripts/gdb.sh regs              # dump all CPU regs via monitor (incl. DEAR)
 #
 # Env:
 #   GDB_PORT  — QEMU gdbstub port (default 4433; port 1234 conflicts with LM Studio)
@@ -130,8 +133,42 @@ raw)
     printf '%s\n' "$CMDS" >> "$SCRIPT"
     ;;
 help|-h|--help)
-    sed -n '2,25p' "$0"
+    sed -n '2,28p' "$0"
     exit 0
+    ;;
+mon)
+    MON_CMD="${2:?usage: $0 mon '<qemu-monitor-cmd>'}"
+    exec python3 -c "
+import socket, time, sys
+s = socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 4444))
+time.sleep(0.3)
+try:
+  while True:
+    d=s.recv(4096)
+    if not d: break
+except: pass
+s.sendall(sys.argv[1].encode()+b'\n')
+time.sleep(1.5); s.settimeout(2); buf=b''
+try:
+  while True:
+    d=s.recv(4096)
+    if not d: break
+    buf+=d
+except: pass
+# strip terminal-escape noise that QEMU echoes back
+out=buf.decode('latin-1', errors='replace')
+import re; out=re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', out)
+out=re.sub(r'.\x08', '', out)  # BS erases prev char
+print(out)
+" "$MON_CMD"
+    ;;
+disasm)
+    ADDR="${2:?usage: $0 disasm <addr> [count]}"
+    N="${3:-16}"
+    exec "$0" mon "x /${N}i $ADDR"
+    ;;
+regs)
+    exec "$0" mon "info registers"
     ;;
 *)
     echo "unknown command: $CMD" >&2

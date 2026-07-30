@@ -1908,17 +1908,26 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7m GDB SESSION FINDING: caught the DSI live via
-         * `scripts/gdb.sh break 0x01855a0c`. The interrupted PC
-         * IS 0x01855a0c — real code (not a corrupted PC as previously
-         * thought). QEMU -d int log shows it fires 20+ times per boot
-         * as DTLB (Data TLB miss) — meaning the CODE at 0x01855a0c
-         * ran fine, but the DATA address it accessed had no valid TLB
-         * entry. Escalated to DSI reported to the guest.
+        /* PHASE 7n GDB SESSION FINDING: caught real disassembly at
+         * 0x01855a0c via QEMU monitor `x/16i 0x01855a0c`. Code is a
+         * bytecode/DFA interpreter loop:
+         *   0x01855a0c: lhz  r9, 0(r8)         load 2-byte token @ r8
+         *   0x01855a10: slwi r0, r9, 2         * 4 (state table index)
+         *   0x01855a14: addi r21, r8, 2        advance stream by 2
+         *   0x01855a18: lwzx r10, r5, r0       load state entry
+         *   0x01855a1c-24: rlwinm bitfield extracts from r10
+         *   0x01855a28: lwzx r25, r28, r26     look up handler
+         *   0x01855a2c: add  r8, r21, r11      advance stream (r11 = variable len)
+         *   0x01855a30: mtctr r25; bctrl        dispatch to handler
          *
-         * Next: identify what data address (DEAR) the code tries to
-         * access. `gdb.sh raw` with an inspection scriptlet after
-         * hitting the breakpoint. */
+         * DEAR from a live guru: 0x6fd42d7c — a heap-region address.
+         * The interpreter walks r8 through a bytecode stream. When
+         * r8 walks off the end into unmapped heap, the lhz faults.
+         *
+         * NEXT: identify what BYTECODE stream this is parsing, and
+         * where r8 initially points. Likely a Roadshow-internal
+         * parser (regex/DFA for something — DNS names? config? IP
+         * expression?) invoked once state=ONLINE lets it run. */
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
