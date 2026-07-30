@@ -1908,11 +1908,17 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7L RESULT: even with full S2_SANA2HOOK impl in place,
-         * auto-online (state=ONLINE + CMD_READ accepted) still gurus
-         * at 0x01855a0c. Roadshow uses BOTH paths — hook AND CMD_READ
-         * queue — the crash lives in the CMD_READ acceptance path
-         * regardless of hook presence. Keep state=CONFIGURED. */
+        /* PHASE 7m GDB SESSION FINDING: caught the DSI live via
+         * `scripts/gdb.sh break 0x01855a0c`. The interrupted PC
+         * IS 0x01855a0c — real code (not a corrupted PC as previously
+         * thought). QEMU -d int log shows it fires 20+ times per boot
+         * as DTLB (Data TLB miss) — meaning the CODE at 0x01855a0c
+         * ran fine, but the DATA address it accessed had no valid TLB
+         * entry. Escalated to DSI reported to the guest.
+         *
+         * Next: identify what data address (DEAR) the code tries to
+         * access. `gdb.sh raw` with an inspection scriptlet after
+         * hitting the breakpoint. */
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
