@@ -2111,14 +2111,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * identical to CMD_READ — fall through. */
         /* fallthrough */
     case CMD_READ: {
-        /* Phase 6k: queue the caller's CMD_READ on their opener's
-         * read queue. Unit task delivers via CopyToBuff when a frame
-         * arrives (see v1000_process_rx).
-         *
-         * PHASE 7i RESULT: accepting CMD_READ while CONFIGURED (with
-         * HW live from Init) also gurus. So CMD_READ acceptance IS
-         * the trigger, not just state=ONLINE value. Reverted to
-         * reject-while-not-ONLINE. */
+        /* PHASE 7j RESULT: immediate-success reply (io_Error=0,
+         * DataLength=0) ALSO gurus. So the trigger is not "holding
+         * the request forever" — it's ANY successful CMD_READ reply.
+         * Roadshow's post-CMD_READ codepath is unconditionally buggy
+         * at 0x01855a0c when reached. Stayed with reject-while-not-
+         * ONLINE. */
         if (devBase->state != V1000_STATE_ONLINE) {
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
