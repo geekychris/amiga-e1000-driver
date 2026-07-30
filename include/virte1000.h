@@ -126,6 +126,14 @@ struct Virte1000Base
     ULONG               unit_signal_mask;   /* filled by task itself */
     volatile BOOL       task_shutdown;
     volatile BOOL       task_ready_ok;      /* task sets on successful start */
+    /* PHASE 7L: Sana2Hook installed via S2_SANA2HOOK. When set, RX
+     * frames are delivered via this hook instead of being dequeued
+     * from per-opener read queues + delivered via the CMD_READ ioreq's
+     * BufferManagement CopyToBuff. Roadshow prefers this mechanism
+     * over CMD_READ when the driver supports it — and may skip the
+     * CMD_READ path entirely, sidestepping the guru at 0x01855a0c. */
+    APTR                sana2hook;   /* struct Sana2Hook* */
+
     /* PHASE 7d: request from BeginIO (Roadshow's context) that the unit
      * task perform v1000_online_hw() and transition to ONLINE. Calling
      * online_hw() directly from BeginIO caused a DSI guru — the IMS

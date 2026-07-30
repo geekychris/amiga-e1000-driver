@@ -471,6 +471,30 @@ static void v1000_process_rx(struct Virte1000Base *base)
 
         ULONG payload_len = frame_len - 14;
 
+        BOOL delivered_this_slot = FALSE;
+
+        /* PHASE 7L: prefer Sana2Hook delivery when installed. Roadshow
+         * installs a hook via S2_SANA2HOOK; if we deliver via it, we
+         * bypass the CMD_READ queue entirely — dodging the guru at
+         * 0x01855a0c which is triggered by any successful CMD_READ. */
+        if (base->sana2hook && base->IUtility) {
+            struct Sana2Hook *sh = (struct Sana2Hook *)base->sana2hook;
+            struct SANA2CopyHookMsg msg;
+            msg.schm_Method  = S2_CopyToBuff;
+            msg.schm_MsgSize = sizeof(msg);
+            msg.schm_To      = NULL;     /* Roadshow-side buffer — hook chooses */
+            msg.schm_From    = rxbuf + 14;
+            msg.schm_Size    = payload_len;
+            (void)base->IUtility->CallHookPkt(&sh->s2h_Hook, base, &msg);
+            /* Consider it delivered — Roadshow decides what to do. */
+            delivered_this_slot = TRUE;
+            base->process_rx_delivered++;
+            rd[12] = 0;
+            IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
+            e1000_write32(mmio, E1000_REG_RDT, slot);
+            continue;
+        }
+
         /* Find any opener with a queued CMD_READ. First-come, first-serve
          * for now — no ethertype filtering (Phase 6l). */
         struct IOSana2Req *ioreq = NULL;
@@ -487,7 +511,6 @@ static void v1000_process_rx(struct Virte1000Base *base)
         }
         IExec->ReleaseSemaphore(&base->opener_lock);
 
-        BOOL delivered_this_slot = FALSE;
         if (ioreq && op && op->copy_to_buff && ioreq->ios2_Data) {
             /* Populate ios2 fields, invoke CopyToBuff hook, reply. */
             for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
@@ -1885,18 +1908,11 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7g-k finding: setting state=ONLINE (which lets
-         * CMD_READ be accepted) reliably gurus at 0x01855a0c in
-         * Roadshow's AddInterface task — regardless of MTU (tested
-         * 1500, 1000), regardless of HW-online timing (Init vs
-         * BeginIO), regardless of signal_event (with/without),
-         * regardless of hold-vs-immediate-reply, regardless of
-         * RawMTU/MTU consistency. Any successful CMD_READ triggers
-         * it. Not our driver's bug — Roadshow's post-CMD_READ path.
-         *
-         * Keep state=CONFIGURED-permanent for stability. Solving this
-         * needs either RE of 0x01855a0c (corrupted PC — hard) or full
-         * S2_SANA2HOOK implementation. */
+        /* PHASE 7L RESULT: even with full S2_SANA2HOOK impl in place,
+         * auto-online (state=ONLINE + CMD_READ accepted) still gurus
+         * at 0x01855a0c. Roadshow uses BOTH paths — hook AND CMD_READ
+         * queue — the crash lives in the CMD_READ acceptance path
+         * regardless of hook presence. Keep state=CONFIGURED. */
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
@@ -2185,6 +2201,23 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * per-type counters yet; report success so Roadshow (which
          * tracks 0x0800/0x0806/0x86DD at bind time) proceeds. */
         break;
+
+    case S2_SANA2HOOK: {
+        /* PHASE 7L: install the Sana2Hook Roadshow gave us. From the
+         * OS4 SDK header, the struct pointer is passed in ios2_Data
+         * (with StatData fallback for compat, same pattern as
+         * DEVICEQUERY). We store the raw pointer; v1000_process_rx
+         * invokes it on each RX frame with a SANA2CopyHookMsg. */
+        APTR hook = ioreq->ios2_Data;
+        if (!hook) hook = ioreq->ios2_StatData;
+        if (!hook) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+            break;
+        }
+        devBase->sana2hook = hook;
+        break;
+    }
 
     case S2_ONEVENT: {
         /* SANA-II event notification. Real drivers (pa6t_eth, etc.)
