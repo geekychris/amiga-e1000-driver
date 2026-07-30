@@ -126,6 +126,14 @@ struct Virte1000Base
     ULONG               unit_signal_mask;   /* filled by task itself */
     volatile BOOL       task_shutdown;
     volatile BOOL       task_ready_ok;      /* task sets on successful start */
+    /* PHASE 7d: request from BeginIO (Roadshow's context) that the unit
+     * task perform v1000_online_hw() and transition to ONLINE. Calling
+     * online_hw() directly from BeginIO caused a DSI guru — the IMS
+     * unmask + IRQ firing + unit-task signal race with Roadshow's
+     * still-executing AddInterface task. Deferring to the unit task
+     * moves the transition to a task context that's not blocking
+     * Roadshow. */
+    volatile BOOL       pending_online;
     struct Task        *parent_task;        /* startup handshake target */
     ULONG               parent_ready_mask;
 
