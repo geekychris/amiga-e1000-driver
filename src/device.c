@@ -1885,13 +1885,13 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* TWO INDEPENDENT GURU TRIGGERS OBSERVED (7d + 7e):
-         *  A) MTU=1500 in DEVICEQUERY reply + NO auto-online in
-         *     CONFIGINTERFACE — Roadshow still crashes at 0x01855a0c
-         *     during some post-CONFIG bookkeeping. MTU=1000 avoids.
-         *  B) Auto-online-in-CONFIGINTERFACE at ANY MTU — same guru
-         *     address, likely IRQ-race with Roadshow's own task.
-         * Current setting: MTU=1000 + no auto-online → stable, no ping. */
+        /* PHASE 7g finding: setting state=ONLINE inside CONFIGINTERFACE
+         * (with or without v1000_online_hw()) reliably gurus at
+         * 0x01855a0c in AddInterface task. Trigger appears to be
+         * something Roadshow does AFTER a CMD_READ is accepted by the
+         * driver (which requires state==ONLINE per the CMD_READ gate).
+         * MTU=1000 + state=CONFIGURED-permanent = stable but ping
+         * doesn't work because CMD_READ never accepted. */
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
