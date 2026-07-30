@@ -2113,21 +2113,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     case CMD_READ: {
         /* Phase 6k: queue the caller's CMD_READ on their opener's
          * read queue. Unit task delivers via CopyToBuff when a frame
-         * arrives (see v1000_process_rx). Caller is expected to have
-         * used SendIO + WaitIO (or DoIO — but DoIO's IOF_QUICK clear
-         * means it Wait's on the reply port anyway).
+         * arrives (see v1000_process_rx).
          *
-         * TODO(next-session): Roadshow does NOT send explicit
-         * S2_ONLINE after CONFIGINTERFACE, so this rejects every
-         * CMD_READ with S2ERR_OUTOFSERVICE while state=CONFIGURED.
-         * Tried auto-online-in-CONFIGINTERFACE (guru, commits 18126d3
-         * + 11bf425) and on-demand-online-inside-CMD_READ (same guru).
-         * Both call v1000_online_hw() from BeginIO context → DSI in
-         * Roadshow's AddInterface task at bsdsocket:0x0185f... Likely
-         * a race between IRQ unmask + rx_ring state or between our
-         * unit-task signal + Roadshow's active flow. Real fix needs to
-         * defer hardware online to unit-task context or discover the
-         * proper Sana2 handshake we're missing. */
+         * PHASE 7i RESULT: accepting CMD_READ while CONFIGURED (with
+         * HW live from Init) also gurus. So CMD_READ acceptance IS
+         * the trigger, not just state=ONLINE value. Reverted to
+         * reject-while-not-ONLINE. */
         if (devBase->state != V1000_STATE_ONLINE) {
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
