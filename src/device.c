@@ -1480,7 +1480,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         if (supply >= offsetof(struct Sana2DeviceQuery, HardwareType) + sizeof(ULONG))
             q->HardwareType = S2WireType_Ethernet;
         if (supply >= offsetof(struct Sana2DeviceQuery, RawMTU) + sizeof(ULONG))
-            q->RawMTU = 1514;
+            q->RawMTU = 1014;   /* MTU + 14-byte Ethernet header */
 
         /* Phase 7a DEFENSIVE: Roadshow's compile of struct
          * Sana2DeviceQuery may have DIFFERENT layout than ours. Our
@@ -1885,15 +1885,18 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7g/h finding: setting state=ONLINE inside CONFIGINTERFACE
-         * (with or without v1000_signal_event, with or without HW-in-Init,
-         * at any MTU) reliably gurus at 0x01855a0c in AddInterface task.
-         * The signal_event isn't the trigger; state=ONLINE alone is.
-         * Trigger appears to be Roadshow accepting-and-then-crashing on
-         * whatever it does after the FIRST CMD_READ we accept.
+        /* PHASE 7g-k finding: setting state=ONLINE (which lets
+         * CMD_READ be accepted) reliably gurus at 0x01855a0c in
+         * Roadshow's AddInterface task — regardless of MTU (tested
+         * 1500, 1000), regardless of HW-online timing (Init vs
+         * BeginIO), regardless of signal_event (with/without),
+         * regardless of hold-vs-immediate-reply, regardless of
+         * RawMTU/MTU consistency. Any successful CMD_READ triggers
+         * it. Not our driver's bug — Roadshow's post-CMD_READ path.
          *
-         * Current stable: state=CONFIGURED permanent → CMD_READ rejects
-         * with S2ERR_OUTOFSERVICE → no crash but no ping. */
+         * Keep state=CONFIGURED-permanent for stability. Solving this
+         * needs either RE of 0x01855a0c (corrupted PC — hard) or full
+         * S2_SANA2HOOK implementation. */
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
          * interface hardware address. Must set it here. Also fill
