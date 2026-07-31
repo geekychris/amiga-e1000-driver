@@ -934,6 +934,33 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
              (ULONG)bus, (ULONG)dev, (ULONG)fn);
     }
 
+    /* Phase 9 probe: also scan for virtio-net-pci (0x1AF4:0x1000 legacy,
+     * 0x1AF4:0x1041 modern). We don't actually use it here — this is a
+     * one-shot sanity check that QEMU is exposing the third NIC to OS4
+     * before we build the virtio_net driver against it. */
+    {
+        struct PCIDevice *vio = devBase->IPCI->FindDeviceTags(
+            FDT_VendorID, 0x1AF4, FDT_DeviceID, 0x1000, TAG_END);
+        if (vio) {
+            uint8 bus = 0, dev = 0, fn = 0;
+            vio->GetAddress(&bus, &dev, &fn);
+            LOGF(log, (CONST_STRPTR)"probe virtio-net legacy (1AF4:1000): FOUND at PCI %02lx:%02lx.%lu\n",
+                 (ULONG)bus, (ULONG)dev, (ULONG)fn);
+        } else {
+            LOGF(log, (CONST_STRPTR)"probe virtio-net legacy (1AF4:1000): not found\n");
+        }
+        vio = devBase->IPCI->FindDeviceTags(
+            FDT_VendorID, 0x1AF4, FDT_DeviceID, 0x1041, TAG_END);
+        if (vio) {
+            uint8 bus = 0, dev = 0, fn = 0;
+            vio->GetAddress(&bus, &dev, &fn);
+            LOGF(log, (CONST_STRPTR)"probe virtio-net modern (1AF4:1041): FOUND at PCI %02lx:%02lx.%lu\n",
+                 (ULONG)bus, (ULONG)dev, (ULONG)fn);
+        } else {
+            LOGF(log, (CONST_STRPTR)"probe virtio-net modern (1AF4:1041): not found\n");
+        }
+    }
+
     /* -------- Phase 3c: dump PCI config space ----------
      * All READS. Safe. Values verified against the QEMU e1000 emulation:
      *   vendor=8086, device=100E, class=0200 (Ethernet), rev=03.
