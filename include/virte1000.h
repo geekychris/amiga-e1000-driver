@@ -178,6 +178,12 @@ struct Virte1000Base
     volatile ULONG      replymsg_skips;
     volatile UWORD      last_skipped_cmd;
 
+    /* Phase 8f: cmd number written on dispatch ENTRY (before switch).
+     * Survives if the switch body crashes — testdiag/DBG_STATUS post-
+     * crash can read it. Note: DBG cmds are excluded (they don't
+     * touch this) so we still see the actual last non-debug cmd. */
+    volatile UWORD      last_dispatched_cmd;
+
     /* Phase 8c: persistent trace log — dos.library file we append every
      * dispatch entry + reply. Opened lazily on first BeginIO (dos.library
      * isn't available at _manager_Init on OS4 boot). Survives task

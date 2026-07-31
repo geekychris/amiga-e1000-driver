@@ -1631,18 +1631,13 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
 {
     struct ExecIFace *IExec = devBase->IExec;
 
-    /* Phase 8c: log every dispatch entry so we can see the last
-     * command Roadshow sent before the crash. Read via /api/file
-     * after the guru appears. */
-    struct MsgPort *rp = ioreq->ios2_Req.io_Message.mn_ReplyPort;
-    TRACEF(devBase, "DISPATCH cmd=%u flags=0x%02x data=0x%08lx bm=0x%08lx rp=0x%08lx rp_flags=0x%02x rp_type=%u\n",
-        (unsigned)ioreq->ios2_Req.io_Command,
-        (unsigned)ioreq->ios2_Req.io_Flags,
-        (unsigned long)ioreq->ios2_Data,
-        (unsigned long)ioreq->ios2_BufferManagement,
-        (unsigned long)rp,
-        (unsigned)(rp ? rp->mp_Flags : 0),
-        (unsigned)(rp ? rp->mp_Node.ln_Type : 0));
+    /* Phase 8f: cmdlog write at DISPATCH ENTRY, not exit. When the
+     * switch-body crashes (e.g., DSI 0x01855a0c inside CMD_WRITE),
+     * the tail cmdlog write in the exit path never runs, so we lose
+     * the record of the crashing command. Write the dispatch stub
+     * NOW; the exit path will (harmlessly) overwrite the same slot
+     * with post-processing state (ioerr/wire/etc.). */
+    devBase->last_dispatched_cmd = ioreq->ios2_Req.io_Command;
 
     switch (ioreq->ios2_Req.io_Command) {
 
@@ -1937,6 +1932,11 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             ioreq->ios2_DstAddr[10] = (UBYTE)(devBase->process_rx_delivered >> 8);
             ioreq->ios2_DstAddr[11] = (UBYTE)(devBase->process_rx_delivered);
         }
+        /* Phase 8f: last_dispatched_cmd in DstAddr[12..13]. Non-zero
+         * post-crash tells us what command was being processed when
+         * the driver task died. */
+        ioreq->ios2_DstAddr[12] = (UBYTE)(devBase->last_dispatched_cmd >> 8);
+        ioreq->ios2_DstAddr[13] = (UBYTE)(devBase->last_dispatched_cmd);
         break;
     }
 
