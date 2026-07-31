@@ -435,6 +435,73 @@ still not working.
 3. Try MULTIPLE alternative Sana2Hook / event-notification pathways
    in sequence to force Roadshow down a different code branch.
 
+### 2026-07-30 — Phase 7r: PACK(2) DEVICEQUERY solves the guru!
+
+User pointed out **rtl8139 works on the same QEMU/OS4 guest**, so the
+crash CANNOT be Roadshow-internal — it has to be something WE return
+that rtl8139 doesn't. Comparative RE of rtl8139.device (extracted via
+xdftool, disassembled via `ppc-amigaos-objdump`) proved it.
+
+**rtl8139's S2_DEVICEQUERY handler** at 0x0100236c:
+```
+lwz r28, 0x50(r31)          # r28 = ioreq->ios2_StatData
+lwz r29, 0(r28)             # r29 = SizeAvailable
+cmplwi r29, 34               # clamp: min(SA, 34) — sizeof pack(2)
+lis r4, 257; addi r4, -24204 # template pointer = 0x0100a174
+mr r6, r29                   # size = 34
+lwz r9, 124(r9); bctrl       # IExec->CopyMem(template, q, size)
+stw r29, 4(r28)              # SizeSupplied
+stw r0, 22(r28)              # BPS at OFFSET 22 — pack(2)!
+```
+
+Template dumped from rodata:
+```
++0-3   SizeAvailable = 0 (caller-preserved)
++4-7   SizeSupplied  = 0 (post-CopyMem overwritten to 34)
++8-11  DevQueryFormat= 0
++12-15 DeviceLevel   = 0
++16-17 AddrFieldSize (UWORD) = 48 = 0x0030
++18-21 MTU  (ULONG) = 1500 = 0x000005DC    ← pack(2) offset
++22-25 BPS  (ULONG) = 0 (runtime overwrite)
++26-29 HardwareType = 1 (Ethernet)
++30-33 RawMTU (ULONG) = 1514 = 0x000005EA
+```
+
+**`sizeof(Sana2DeviceQuery)` on the wire = 34**, not 36. rtl8139
+uses pack(2) alignment. Our compilation uses natural PPC alignment
+(sizeof=36), so `q->MTU = X` writes at offset 20 (padding after
+AddrFieldSize UWORD), not offset 18 where Roadshow reads. Roadshow
+saw garbage MTU (byte from AddrFieldSize's padding), used it as a
+size in the interpreter loop, walked past a heap buffer → crash.
+
+**Fix landed (commit `9b441eb`)**: byte-level writes at rtl8139's
+exact pack(2) offsets in our S2_DEVICEQUERY handler. Also cap
+SizeSupplied at 34.
+
+**Result**: NO GURU at boot. NO GURU on manual AddNetInterface.
+Interface still fails to add ("Input/output error" — a different
+problem to chase separately), but the WEEK-LONG crash is gone.
+
+**Lesson learned — the recurring failure mode**:
+When we hit "some external code crashes on our data," always
+compare byte-for-byte with a WORKING reference driver on the SAME
+platform. I chased "Roadshow bug" theories for many sessions when
+the actual problem was `sizeof(Sana2DeviceQuery) = 34 vs 36` — a
+literal 2-byte struct-layout mismatch. Should have been the FIRST
+thing checked once rtl8139 was known to work.
+
+### Next-session direction (from Phase 7r)
+
+Now the interface fails to add with "Input/output error". cmdlog
+shows only 1 unknown command reached us before Roadshow bailed.
+Testopen still succeeds, so it's not OpenDevice. Investigate:
+1. What's the first command Roadshow sends? Add cmdlog capture of
+   raw io_Command word (currently only shows resolved name).
+2. Compare rtl8139's Open handler to ours — maybe we need to
+   return something specific.
+3. Try letting the boot-time AddNetInterface run without the
+   "device already open by test" state that manual retry hits.
+
 ## Reference source repositories
 
 - **[rolsen74/amy_skeletons/dev_Sana2](https://github.com/rolsen74/amy_skeletons/tree/main/dev_Sana2/src)**
