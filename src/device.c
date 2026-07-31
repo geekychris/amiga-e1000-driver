@@ -1532,56 +1532,55 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             for (int i = 0; i < 48; i++) dst[i] = src[i];
         }
 
-        ULONG size_full = (ULONG)sizeof(struct Sana2DeviceQuery);
-        /* PHASE 7a ROOT-CAUSE FIX: Roadshow leaves q->SizeAvailable = 0
-         * (probed empirically via V1000_DBG_DQBUF snapshot). The
-         * previous "only write if supply >= offset" logic then
-         * skipped EVERY field, Roadshow read all zeros including
-         * MTU=0, and its post-CONFIG alloc failed with "Could not
-         * allocate a network packet ... of 0 bytes". Treat
-         * SizeAvailable=0 as "caller allocated the full struct" -
-         * Roadshow's buffer IS sizeof(struct Sana2DeviceQuery) bytes,
-         * just SizeAvailable isn't populated. */
-        ULONG supply    = q->SizeAvailable ? q->SizeAvailable : size_full;
-        if (supply > size_full) supply = size_full;
-        q->SizeSupplied   = supply;
-        q->DevQueryFormat = 0;
-        q->DeviceLevel    = 0;
-        if (supply >= offsetof(struct Sana2DeviceQuery, AddrFieldSize) + sizeof(UWORD))
-            q->AddrFieldSize = 48;
-        if (supply >= offsetof(struct Sana2DeviceQuery, MTU) + sizeof(ULONG))
-            q->MTU = 1000;   /* EXPERIMENT: try smaller MTU to see if Roadshow's post-CONFIG guru at 0x01855a0c changes/vanishes */
-        if (supply >= offsetof(struct Sana2DeviceQuery, BPS) + sizeof(ULONG))
-            q->BPS = 1000000000UL;   /* pa6t matches this - QEMU e1000 is line-rate */
-        if (supply >= offsetof(struct Sana2DeviceQuery, HardwareType) + sizeof(ULONG))
-            q->HardwareType = S2WireType_Ethernet;
-        if (supply >= offsetof(struct Sana2DeviceQuery, RawMTU) + sizeof(ULONG))
-            q->RawMTU = 1014;   /* MTU + 14-byte Ethernet header */
-
-        /* Phase 7a DEFENSIVE: Roadshow's compile of struct
-         * Sana2DeviceQuery may have DIFFERENT layout than ours. Our
-         * OS4 SDK header has #pragma pack(2) so AddrFieldSize (UWORD
-         * at offset 16) is followed IMMEDIATELY by MTU (ULONG at
-         * offset 18). Barthel's Roadshow may have been compiled
-         * WITHOUT pack(2) — then AddrFieldSize (offset 16) has
-         * 2-byte alignment padding, MTU at offset 20, BPS at 24, etc.
-         * Roadshow reads MTU at offset 20 sees 0 (we didn't write
-         * there) - the "Could not allocate a network packet of 0
-         * bytes" mystery. Write the fields at BOTH plausible offsets
-         * to cover both compile ABIs. */
-        /* PHASE 7c FIX: after switching to ios2_StatData (spec-correct),
-         * HardwareType came through as Ethernet=1 (verified via
-         * QueryInterfaceTagList) — proving bsdsocket uses natural PPC
-         * alignment for the Sana2DeviceQuery struct (HardwareType at
-         * offset 28, MTU at offset 20). The natural `q->MTU = 1500`
-         * write above lands at the right offset — no shotgun needed.
+        /* PHASE 7r ROOT CAUSE FIX (rtl8139 comparative RE):
+         * Disassembly of rtl8139.device's S2_DEVICEQUERY at 0x1002370
+         * shows it uses PACK(2) Sana2DeviceQuery — sizeof = 34, NOT 36.
+         * MTU is at offset 18, BPS at 22, HardwareType at 26, RawMTU
+         * at 30. Our compilation uses NATURAL PPC alignment so our
+         * `q->MTU = X` writes at offset 20 (wrong). Roadshow reads
+         * fields at the pack(2) offsets — which for us are still 0
+         * plus one AddrFieldSize-padding byte, i.e. garbage. That
+         * garbage propagates into the interpreter at 0x01855a0c and
+         * crashes.
          *
-         * bsdsocket allocates the query struct as sizeof(struct
-         * Sana2DeviceQuery) = 36 bytes even though it passes
-         * ios2_DataLength = 24 for the pre-Rev-7 subset. Writes past
-         * offset 24 land in valid struct memory (28 = HardwareType,
-         * 32 = RawMTU) — that's why HardwareType came through. Same
-         * applies to MTU. No additional writes needed. */
+         * Fix: byte-level writes at rtl8139's exact offsets. Ignore
+         * our compiler's `struct Sana2DeviceQuery` layout entirely
+         * for the wire representation. Also matches rtl8139's cap
+         * of size=34 in SizeSupplied. */
+        UBYTE *raw = (UBYTE *)q;
+        ULONG size_wire = 34;   /* pack(2) Sana2DeviceQuery */
+        ULONG supply = q->SizeAvailable ? q->SizeAvailable : size_wire;
+        if (supply > size_wire) supply = size_wire;
+
+        /* Zero-fill the wire range we'll fill so we don't leave stale
+         * bytes in the reply from a prior request. */
+        for (ULONG i = 0; i < supply; i++) raw[i] = 0;
+
+        #define S2DQ_WU16(off, val)   do { \
+            if (supply >= (off) + 2) { \
+                raw[(off) + 0] = (UBYTE)(((val) >> 8) & 0xFF); \
+                raw[(off) + 1] = (UBYTE)( (val)       & 0xFF); \
+            } } while (0)
+        #define S2DQ_WU32(off, val)   do { \
+            if (supply >= (off) + 4) { \
+                raw[(off) + 0] = (UBYTE)(((val) >> 24) & 0xFF); \
+                raw[(off) + 1] = (UBYTE)(((val) >> 16) & 0xFF); \
+                raw[(off) + 2] = (UBYTE)(((val) >>  8) & 0xFF); \
+                raw[(off) + 3] = (UBYTE)( (val)        & 0xFF); \
+            } } while (0)
+
+        S2DQ_WU32( 0, q->SizeAvailable);   /* preserve caller's value */
+        S2DQ_WU32( 4, supply);             /* SizeSupplied */
+        S2DQ_WU32( 8, 0);                  /* DevQueryFormat */
+        S2DQ_WU32(12, 0);                  /* DeviceLevel */
+        S2DQ_WU16(16, 48);                 /* AddrFieldSize (UWORD) */
+        S2DQ_WU32(18, 1500);               /* MTU — pack(2) offset */
+        S2DQ_WU32(22, 1000000000UL);       /* BPS — pack(2) offset */
+        S2DQ_WU32(26, S2WireType_Ethernet);/* HardwareType — pack(2) offset */
+        S2DQ_WU32(30, 1514);               /* RawMTU — pack(2) offset */
+
+        #undef S2DQ_WU16
+        #undef S2DQ_WU32
         /* Phase 7a diagnostic AFTER snapshot. */
         {
             volatile UBYTE *src = (volatile UBYTE *)q;
@@ -1961,12 +1960,12 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7q RESULT: refactored to per-unit-process arch per
-         * the rolsen74 skeleton — BeginIO does only PutMsg, unit task
-         * dispatches. Retested auto-online: guru STILL fires (with
-         * OR without HW enable, task=virte1000-unit now). So the
-         * bug is truly in Roadshow's code, not in when we run.
-         * Stuck at state=CONFIGURED baseline. */
+        /* PHASE 7r: pack(2) DEVICEQUERY landed. Boot succeeds without
+         * guru — Roadshow's OpenDevice on us fails ("Device/unit failed
+         * to open") for reasons TBD, but that's a separate issue and
+         * doesn't crash the guest. Manual AddNetInterface + auto-online
+         * still gurus though. Leaving state=CONFIGURED baseline while
+         * we investigate boot-time OpenDevice failure. */
         /* v1000_online_hw(devBase); */
         /* devBase->state = V1000_STATE_ONLINE; */
         /* v1000_signal_event(devBase, S2EVENT_ONLINE); */
