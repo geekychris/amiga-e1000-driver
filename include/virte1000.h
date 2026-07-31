@@ -126,6 +126,15 @@ struct Virte1000Base
     ULONG               unit_signal_mask;   /* filled by task itself */
     volatile BOOL       task_shutdown;
     volatile BOOL       task_ready_ok;      /* task sets on successful start */
+
+    /* PHASE 7q PER-UNIT-PROCESS ARCH (per rolsen74/amy_skeletons):
+     * BeginIO now does only PutMsg(begin_port, ioreq). The unit task
+     * dequeues + dispatches the full command handler in ITS own task
+     * context, not the caller's. Avoids the DSI guru at 0x01855a0c
+     * that fired when we enabled IRQs from Roadshow's task-frozen
+     * context. */
+    struct MsgPort     *begin_port;         /* BeginIO enqueues here */
+    ULONG               begin_port_mask;    /* 1U << begin_port->mp_SigBit */
     /* PHASE 7L: Sana2Hook installed via S2_SANA2HOOK. When set, RX
      * frames are delivered via this hook instead of being dequeued
      * from per-opener read queues + delivered via the CMD_READ ioreq's

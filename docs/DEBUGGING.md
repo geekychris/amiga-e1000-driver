@@ -382,6 +382,59 @@ new unit-process main loop dispatches to handlers. Keeps our
 SANA-II handler bodies mostly intact, just moves them out of the
 caller's task context.
 
+### 2026-07-30 — Phase 7q: refactor landed, guru still fires — Roadshow bug confirmed
+
+Implemented the skeleton's per-unit-process architecture:
+- Added `begin_port` MsgPort to `Virte1000Base`. Allocated by the
+  unit task itself (signals are per-task).
+- `_manager_BeginIO` is now just: clear IOF_QUICK, set io_Error=0,
+  set ln_Type=NT_MESSAGE, `PutMsg(begin_port, ioreq)`.
+- `v1000_dispatch_ioreq` is the extracted switch/case (formerly the
+  whole body of BeginIO). Runs in the unit task's context.
+- Unit-task loop's wait_mask now includes `begin_port_mask`;
+  drains all queued msgs when signaled.
+
+**Result** (with auto-online CONFIGURED→ONLINE re-enabled and full
+HW enable via `v1000_online_hw` from the dispatch): **guru still
+fires** at the same PC 0x01855a0c. Faulting task is now
+`virte1000-unit` (was `AddInterface`) — but the fault PC and the
+crashing code are identical.
+
+Tested variants:
+- Refactor + auto-online + HW enable: guru
+- Refactor + auto-online + NO HW enable (state=ONLINE, RCTL off):
+  guru (same PC)
+- Refactor + no auto-online (state stays CONFIGURED): stable, no
+  ping (baseline)
+
+So Roadshow's bug at 0x01855a0c is not sensitive to WHOSE task
+touches it — it triggers as soon as Roadshow processes our
+"CONFIGINTERFACE succeeded, state=ONLINE" reply. The rolsen74
+skeleton hypothesis (that BeginIO context was the crash trigger)
+was **wrong**. The bug is Roadshow-internal, invoked by Roadshow's
+own post-config code path.
+
+**However, the refactor is a strict improvement architecturally**:
+- Per-unit-process ordering (no BeginIO races)
+- Aligned with rolsen74 skeleton's proven pattern
+- Sets us up for the RIGHT flow when Roadshow's bug is resolved
+  (either via source or workaround)
+
+Keeping refactor, baseline still state=CONFIGURED-permanent. Ping
+still not working.
+
+**Genuine remaining paths**:
+1. RE 0x018559b0 further — decompile the interpreter and identify
+   what data structure it walks. The bytecode format's magic
+   constants (0x25050750, 0x52057050) might match a specific
+   library. If it's e.g. `iprintf.library` or DNS name parser,
+   knowing the caller's expectations may reveal a workaround.
+2. Contact the OS4 community with the reproducible crash trace at
+   0x01855a0c triggered by "MTU=any + state=ONLINE from any SANA-II
+   driver". Barthel or others may have Roadshow source access.
+3. Try MULTIPLE alternative Sana2Hook / event-notification pathways
+   in sequence to force Roadshow down a different code branch.
+
 ## Reference source repositories
 
 - **[rolsen74/amy_skeletons/dev_Sana2](https://github.com/rolsen74/amy_skeletons/tree/main/dev_Sana2/src)**

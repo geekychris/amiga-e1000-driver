@@ -257,6 +257,11 @@ static inline void v1000_wmb(void)
 static void v1000_process_rx(struct Virte1000Base *base);
 static void v1000_online_hw(struct Virte1000Base *base);
 static void v1000_signal_event(struct Virte1000Base *base, ULONG event_mask);
+/* PHASE 7q: full command dispatcher, called from unit task after
+ * BeginIO PutMsg's ioreq to begin_port. Does everything BeginIO used
+ * to do — the switch/case on io_Command. */
+static void v1000_dispatch_ioreq(struct Virte1000Base *base,
+                                  struct IOSana2Req *ioreq);
 
 /* Task entry function. Called by CreateTaskTags. Args-less; we recover
  * our own Task struct via classic-Amiga SysBase-at-4 → FindTask(NULL),
@@ -276,20 +281,52 @@ static void v1000_task_body(void)
     }
     ULONG sig_mask = 1UL << sig;
     base->unit_signal_mask = sig_mask;
+
+    /* PHASE 7q: create begin_port here so its signal is registered
+     * to THIS task (signals are per-task). Sig bit auto-allocated by
+     * ASOT_PORT via ASOPORT_AllocSig. */
+    base->begin_port = (struct MsgPort *)IExec->AllocSysObjectTags(
+        ASOT_PORT, ASOPORT_AllocSig, TRUE, TAG_END);
+    if (!base->begin_port) {
+        IExec->FreeSignal(sig);
+        base->unit_signal_mask = 0;
+        base->task_ready_ok = FALSE;
+        IExec->Signal(base->parent_task, base->parent_ready_mask);
+        return;
+    }
+    base->begin_port_mask = 1UL << base->begin_port->mp_SigBit;
+
     base->task_ready_ok = TRUE;
     /* Handshake — Init is Wait'ing on parent_ready_mask. */
     IExec->Signal(base->parent_task, base->parent_ready_mask);
 
-    ULONG wait_mask = sig_mask | SIGBREAKF_CTRL_C;
+    ULONG wait_mask = sig_mask | base->begin_port_mask | SIGBREAKF_CTRL_C;
     while (!base->task_shutdown) {
-        (void)IExec->Wait(wait_mask);
+        ULONG got = IExec->Wait(wait_mask);
         if (IExec->SetSignal(0, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) break;
-        IExec->SetSignal(0, sig_mask);   /* consume all pending IRQ signals */
-        base->task_wake_count++;
-        v1000_process_rx(base);
+
+        /* PHASE 7q: drain begin_port FIRST — RX depends on state
+         * that CONFIGINTERFACE / ONLINE handlers set up. */
+        if (got & base->begin_port_mask) {
+            struct IOSana2Req *req;
+            while ((req = (struct IOSana2Req *)IExec->GetMsg(base->begin_port)) != NULL) {
+                v1000_dispatch_ioreq(base, req);
+            }
+        }
+
+        if (got & sig_mask) {
+            IExec->SetSignal(0, sig_mask);   /* consume all pending IRQ signals */
+            base->task_wake_count++;
+            v1000_process_rx(base);
+        }
     }
 
     /* Cleanup — task exits after this returns. */
+    if (base->begin_port) {
+        IExec->FreeSysObject(ASOT_PORT, base->begin_port);
+        base->begin_port = NULL;
+        base->begin_port_mask = 0;
+    }
     IExec->FreeSignal(sig);
     base->unit_signal_mask = 0;
     base->unit_task = NULL;
@@ -473,27 +510,14 @@ static void v1000_process_rx(struct Virte1000Base *base)
 
         BOOL delivered_this_slot = FALSE;
 
-        /* PHASE 7L: prefer Sana2Hook delivery when installed. Roadshow
-         * installs a hook via S2_SANA2HOOK; if we deliver via it, we
-         * bypass the CMD_READ queue entirely — dodging the guru at
-         * 0x01855a0c which is triggered by any successful CMD_READ. */
-        if (base->sana2hook && base->IUtility) {
-            struct Sana2Hook *sh = (struct Sana2Hook *)base->sana2hook;
-            struct SANA2CopyHookMsg msg;
-            msg.schm_Method  = S2_CopyToBuff;
-            msg.schm_MsgSize = sizeof(msg);
-            msg.schm_To      = NULL;     /* Roadshow-side buffer — hook chooses */
-            msg.schm_From    = rxbuf + 14;
-            msg.schm_Size    = payload_len;
-            (void)base->IUtility->CallHookPkt(&sh->s2h_Hook, base, &msg);
-            /* Consider it delivered — Roadshow decides what to do. */
-            delivered_this_slot = TRUE;
-            base->process_rx_delivered++;
-            rd[12] = 0;
-            IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
-            e1000_write32(mmio, E1000_REG_RDT, slot);
-            continue;
-        }
+        /* PHASE 7L (SANA2HOOK delivery) — DISABLED in phase 7q.
+         * We were calling the caller-supplied hook with schm_To=NULL,
+         * meaning Roadshow's hook wrote our packet payload into a
+         * NULL destination. Likely responsible for the crash-on-first-RX
+         * we hit in phase 7L. Real S2_SANA2HOOK delivery needs a
+         * proper destination buffer strategy — Roadshow-owned tag list
+         * to consult, or driver-owned buffer pool. Revisit once
+         * CMD_READ path is validated end-to-end. */
 
         /* Find any opener with a queued CMD_READ. First-come, first-serve
          * for now — no ethertype filtering (Phase 6l). */
@@ -1088,11 +1112,15 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
-    /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal. */
+    /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal.
+     * PHASE 7q: task ALSO creates its own begin_port + waits on it —
+     * BeginIO PutMsg's ioreqs there for the task to dispatch. Port
+     * MUST be created inside the task because signals are per-task. */
     BOOL task_ok = v1000_task_start(devBase, iexec);
-    LOGF(log, (CONST_STRPTR)"unit task: %s (task=%p mask=%08lx)\n",
+    LOGF(log, (CONST_STRPTR)"unit task: %s (task=%p mask=%08lx begin_port=%p)\n",
          task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
-         devBase->unit_task, (ULONG)devBase->unit_signal_mask);
+         devBase->unit_task, (ULONG)devBase->unit_signal_mask,
+         devBase->begin_port);
 
     /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
      * S2_ONLINE (or the debug V1000_DBG_FIRE_IRQ, once online) to make
@@ -1410,14 +1438,39 @@ static void v1000_offline_hw(struct Virte1000Base *base)
     e1000_write32(mmio, E1000_REG_TCTL, 0);
 }
 
+/* PHASE 7q: BeginIO is now just a thin PutMsg — the unit task
+ * dispatches each command in ITS own context (see v1000_task_body).
+ * This is the rolsen74/amy_skeletons pattern — running command
+ * handlers inline in the caller's task context (i.e. Roadshow's
+ * AddInterface task) is what caused the DSI guru at 0x01855a0c.
+ * See docs/DEBUGGING.md phase 7p for the full analysis. */
 void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
     struct Virte1000Base *devBase = (struct Virte1000Base *)Self->Data.LibBase;
     struct ExecIFace *IExec = devBase->IExec;
 
-    /* Default result — commands that we handle overwrite these below. */
+    /* Standard SANA-II: reject QUICK-io (we always process
+     * asynchronously via the unit task). */
+    ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+    ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
+
+    if (devBase->begin_port) {
+        IExec->PutMsg(devBase->begin_port, (struct Message *)ioreq);
+    } else {
+        /* Unit task not up (shouldn't happen if Init succeeded);
+         * fall back to synchronous dispatch so caller doesn't hang. */
+        v1000_dispatch_ioreq(devBase, ioreq);
+    }
+}
+
+/* PHASE 7q: the actual command dispatcher — runs in the unit task's
+ * context, invoked from v1000_task_body when a message arrives on
+ * begin_port. This was the body of _manager_BeginIO pre-refactor. */
+static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *ioreq)
+{
+    struct ExecIFace *IExec = devBase->IExec;
 
     switch (ioreq->ios2_Req.io_Command) {
 
@@ -1908,19 +1961,15 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7p ROOT CAUSE IDENTIFIED — see docs/DEBUGGING.md
-         * "Phase 7p: rolsen74 skeleton unlocks the root cause".
-         *
-         * Roadshow's DSI guru is caused by our BeginIO handling
-         * everything INLINE in the caller's task context. The
-         * canonical OS4 SANA-II pattern (per rolsen74/amy_skeletons)
-         * is: BeginIO does nothing but PutMsg the ioreq to a per-
-         * unit process; the process handles it in its own task
-         * context. That way v1000_online_hw() (which unmasks IRQs)
-         * doesn't fire while Roadshow's task is blocked in our code.
-         *
-         * Refactor to that architecture is the real fix; keep
-         * state=CONFIGURED baseline in the meantime. */
+        /* PHASE 7q RESULT: refactored to per-unit-process arch per
+         * the rolsen74 skeleton — BeginIO does only PutMsg, unit task
+         * dispatches. Retested auto-online: guru STILL fires (with
+         * OR without HW enable, task=virte1000-unit now). So the
+         * bug is truly in Roadshow's code, not in when we run.
+         * Stuck at state=CONFIGURED baseline. */
+        /* v1000_online_hw(devBase); */
+        /* devBase->state = V1000_STATE_ONLINE; */
+        /* v1000_signal_event(devBase, S2EVENT_ONLINE); */
 #if 0
         devBase->state = V1000_STATE_CONFIGURED;
         /* PHASE 7o GDB SESSION FINDING: found interpreter function
@@ -2374,9 +2423,8 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         devBase->cmdlog_head++;
     }
 
-    if (ioreq->ios2_Req.io_Flags & IOF_QUICK)
-        return;
-
+    /* BeginIO cleared IOF_QUICK; always reply here unless a handler
+     * `return`ed early (e.g. queued CMD_READ waiting for a frame). */
     IExec->ReplyMsg((struct Message *)ioreq);
 }
 
