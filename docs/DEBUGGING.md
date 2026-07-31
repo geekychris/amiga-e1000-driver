@@ -502,6 +502,64 @@ Testopen still succeeds, so it's not OpenDevice. Investigate:
 3. Try letting the boot-time AddNetInterface run without the
    "device already open by test" state that manual retry hits.
 
+### 2026-07-30 — Phase 7s: found + fixed the pack(2) regression
+
+Empirical A/B testing revealed the 7r "I/O error" cause: my
+`for (i=0; i<supply; i++) raw[i]=0;` zero-fill was writing 34 bytes
+into Roadshow's actual **24-byte** DEVICEQUERY buffer. Bytes 24-33
+clobbered Roadshow's adjacent memory (a state struct, IORequest,
+whatever) → AddInterface failed with "Device/unit failed to open"
+even though our Open callback itself worked (testopen kept passing).
+
+**Fix**: hardcode `supply=24` (Roadshow's actual buffer size). Only
+zero those 24 bytes. Per-field writes bounded by supply so
+HardwareType (offset 26) and RawMTU (offset 30) get skipped —
+Roadshow only cares about MTU, which lands at offset 18-21, safely
+inside 24 bytes.
+
+Committed `8025689`. Result:
+- Interface adds cleanly at boot ("Object exists" on re-add)
+- `testquery`: MTU=1500, HardwareMTU=1500, State=2 CONFIGURED,
+  NumReadRequestsPending=31
+
+### 2026-07-30 — Phase 7t: auto-online works — no guru!
+
+With pack(2) MTU correctly delivered, re-enabled auto-online in
+CONFIGINTERFACE (state=V1000_STATE_ONLINE, call v1000_online_hw,
+signal S2EVENT_ONLINE). **No guru.** The interpreter crash at
+0x01855a0c that plagued us for many sessions is truly DEAD.
+
+Root cause of the whole saga:
+- rtl8139.device (which works) uses `sizeof(Sana2DeviceQuery)=34`
+  (pack(2) alignment: MTU at offset 18, BPS at 22, HW at 26,
+  RawMTU at 30).
+- Our compiler used natural PPC alignment giving `sizeof=36` with
+  MTU at offset 20, BPS at 24, HW at 28, RawMTU at 32.
+- Roadshow read fields at pack(2) offsets, saw garbage where MTU
+  should be, propagated it through its DFA interpreter, walked off
+  a heap buffer boundary → DTLB → DSI guru reported at PC 0x01855a0c.
+
+Committed `c62ac8e`. Query now reports:
+- MTU=1500, HardwareMTU=1500, State=3 (bsdsocket-level ONLINE?),
+  NumReadRequestsPending=32
+
+Ping still fails (packets transmit but no response — going via
+rtl8139 instead of virte1000 for the 192.168.100.x route). And
+`testdiag` now hangs, probably due to dispatch backlog since
+CMD_READ is accepted+queued+never-replied. Both are next-session
+issues but the CORE crash is gone.
+
+### Meta-lesson
+
+User's insight "rtl8139 works on the same guest, so the crash
+can't be a Roadshow bug" was the turnkey observation. Once we
+extracted rtl8139.device and disassembled its DEVICEQUERY handler,
+the pack(2) layout was obvious in 20 minutes of work. **Session
+one probably could have solved this** by comparative RE of any
+known-working reference driver's DEVICEQUERY. Add to permanent
+routine: **when Roadshow rejects our data, compare our reply
+byte-for-byte with rtl8139's**.
+
 ## Reference source repositories
 
 - **[rolsen74/amy_skeletons/dev_Sana2](https://github.com/rolsen74/amy_skeletons/tree/main/dev_Sana2/src)**
