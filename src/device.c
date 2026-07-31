@@ -503,27 +503,41 @@ static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
  * Open, and these helpers dispatch accordingly. */
 typedef BOOL (*V1000CopyFn)(APTR to, APTR from, ULONG size);
 
-/* Isolation test: bypass BOTH copy hook invocation paths. If the
- * DSI at 0x01855a0c disappears when we never call into Roadshow's
- * hooks, we've located it to the hook-invocation ABI. If the DSI
- * persists, the crash is elsewhere (CONFIGINTERFACE, ReplyMsg,
- * event delivery, ...) and we've eliminated a hypothesis. */
-#define V1000_BYPASS_COPYHOOKS 1
+/* Phase 8d: kill switch OFF. With S2_SANA2HOOK now handled properly
+ * (Roadshow's preferred delivery path), invoke_copy_to/from should
+ * hit the sana2_hook branch first — a CallHookPkt on a legit Hook*
+ * with a proper SANA2CopyHookMsg. That eliminates the wrong-ABI
+ * hypothesis that motivated this bypass. */
+#define V1000_BYPASS_COPYHOOKS 0
 
 static BOOL v1000_invoke_copy_to(struct Virte1000Base *base,
                                  struct V1000Opener *op,
                                  struct IOSana2Req *ioreq,
                                  APTR from, ULONG size)
 {
-    if (!op || !op->copy_to_buff) return FALSE;
+    if (!op) return FALSE;
     base->copy_to_calls++;
+    base->last_copy_to_size = size;
+
+    /* Preferred path: Roadshow installed a Sana2Hook via S2_SANA2HOOK.
+     * That hook services multiple methods; invoke with schm_Method =
+     * S2_CopyToBuff and a SANA2CopyHookMsg. Falls through to tag-list
+     * fallback if the hook wasn't installed. */
+    if (op->sana2_hook) {
+        base->last_copy_to_ptr = op->sana2_hook;
+        base->last_copy_to_tag = S2_CopyToBuff;
+        struct SANA2CopyHookMsg msg;
+        msg.schm_Method  = S2_CopyToBuff;
+        msg.schm_MsgSize = sizeof(msg);
+        msg.schm_To      = ioreq->ios2_Data;
+        msg.schm_From    = from;
+        msg.schm_Size    = size;
+        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+            op->sana2_hook, ioreq, &msg);
+    }
+    if (!op->copy_to_buff) return FALSE;
     base->last_copy_to_ptr = op->copy_to_buff;
     base->last_copy_to_tag = op->copy_to_tag;
-    base->last_copy_to_size = size;
-#if V1000_BYPASS_COPYHOOKS
-    (void)base; (void)ioreq; (void)from;
-    return TRUE;   /* pretend we delivered */
-#else
     if (op->copy_to_tag == S2_CopyToBuff) {
         V1000CopyFn fn = (V1000CopyFn)op->copy_to_buff;
         return fn(ioreq->ios2_Data, from, size);
@@ -536,7 +550,6 @@ static BOOL v1000_invoke_copy_to(struct Virte1000Base *base,
     msg.schm_Size    = size;
     return (BOOL)(ULONG)base->IUtility->CallHookPkt(
         (struct Hook *)op->copy_to_buff, ioreq, &msg);
-#endif
 }
 
 static BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
@@ -544,15 +557,25 @@ static BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
                                    struct IOSana2Req *ioreq,
                                    APTR to, ULONG size)
 {
-    if (!op || !op->copy_from_buff) return FALSE;
+    if (!op) return FALSE;
     base->copy_from_calls++;
+    base->last_copy_from_size = size;
+
+    if (op->sana2_hook) {
+        base->last_copy_from_ptr = op->sana2_hook;
+        base->last_copy_from_tag = S2_CopyFromBuff;
+        struct SANA2CopyHookMsg msg;
+        msg.schm_Method  = S2_CopyFromBuff;
+        msg.schm_MsgSize = sizeof(msg);
+        msg.schm_To      = to;
+        msg.schm_From    = ioreq->ios2_Data;
+        msg.schm_Size    = size;
+        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+            op->sana2_hook, ioreq, &msg);
+    }
+    if (!op->copy_from_buff) return FALSE;
     base->last_copy_from_ptr = op->copy_from_buff;
     base->last_copy_from_tag = op->copy_from_tag;
-    base->last_copy_from_size = size;
-#if V1000_BYPASS_COPYHOOKS
-    (void)base; (void)ioreq; (void)to;
-    return TRUE;
-#else
     if (op->copy_from_tag == S2_CopyFromBuff) {
         V1000CopyFn fn = (V1000CopyFn)op->copy_from_buff;
         return fn(to, ioreq->ios2_Data, size);
@@ -565,7 +588,6 @@ static BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
     msg.schm_Size    = size;
     return (BOOL)(ULONG)base->IUtility->CallHookPkt(
         (struct Hook *)op->copy_from_buff, ioreq, &msg);
-#endif
 }
 
 /* Walk the RX ring, deliver frames to queued CMD_READ requests via the
@@ -574,13 +596,8 @@ static BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
 static void v1000_process_rx(struct Virte1000Base *base)
 {
     if (!base->rx_ring || !base->bar0 || !base->IUtility) return;
-    /* Phase 8 debug: SKIP RX entirely. If the DSI-at-0x01855a0c crash
-     * goes away with RX disabled, the trigger is either our CopyToBuff
-     * bypass replying to CMD_READ with fake success (Roadshow parses
-     * the "packet" and walks garbage into its bytecode interpreter) or
-     * the mere ReplyMsg on the ioreq firing a PA_SOFTINT that runs
-     * Roadshow's post-RX handler with bad state. */
-    return;
+    /* Phase 8d: RX re-enabled. With sana2_hook path handling delivery
+     * via a real Hook+SANA2CopyHookMsg, RX-side crash risk goes down. */
     struct ExecIFace *IExec = base->IExec;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
@@ -2120,14 +2137,12 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
              * the physical MAC on the wire won't actually change until we
              * wire the write. */
         }
-        /* Phase 8 debug: DISABLE auto-online. Auto-online → Roadshow
-         * sends CMD_WRITE (via ping ARP broadcast) → task crashes at
-         * SRR0 0x01855a0c (Roadshow's bytecode-interpreter loop @ lhz
-         * r9,0(r8), see Phase 7n comment). Investigation ongoing.
-         * Leaving state=CONFIGURED lets the interface bind + shows in
-         * netstat, but Roadshow won't send packets through us, so the
-         * guest stays crash-free while we bisect the cause. */
-        devBase->state = V1000_STATE_CONFIGURED;
+        /* Phase 8d: auto-online re-enabled now that S2_SANA2HOOK is
+         * handled — Roadshow's Copy* invocations go through a real
+         * Hook+SANA2CopyHookMsg, so RX/TX delivery should be safe. */
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
 #if 0
         devBase->state = V1000_STATE_CONFIGURED;
         /* PHASE 7o GDB SESSION FINDING: found interpreter function
@@ -2201,13 +2216,17 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
     }
 
     case S2_ONLINE: {
-        /* Phase 8 debug: BLOCK the ONLINE transition. Refuse with a
-         * "not ready" error so Roadshow keeps the interface DOWN and
-         * never queues CMD_WRITE / S2_BROADCAST — the path that
-         * triggers the DSI at SRR0 0x01855a0c. Restore once the crash
-         * cause is identified. */
-        ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-        ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
+        /* SANA-II-NOTES §3.4: requires CONFIGURED. On success enables
+         * RX/TX and unmasks IRQs, transitions state to ONLINE. */
+        if (devBase->state == V1000_STATE_ONLINE) break;   /* idempotent */
+        if (devBase->state != V1000_STATE_CONFIGURED) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
+            break;
+        }
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
         break;
     }
 
@@ -2282,7 +2301,8 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
             IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
-        BOOL cooked = (op != NULL) && (op->copy_from_buff != NULL) && (devBase->IUtility != NULL);
+        BOOL cooked = (op != NULL) && (devBase->IUtility != NULL) &&
+                      (op->sana2_hook != NULL || op->copy_from_buff != NULL);
 
         if (cooked) {
             /* Build 14-byte Ethernet header */
@@ -2461,19 +2481,45 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
         break;
 
     case S2_SANA2HOOK: {
-        /* PHASE 7L: install the Sana2Hook Roadshow gave us. From the
-         * OS4 SDK header, the struct pointer is passed in ios2_Data
-         * (with StatData fallback for compat, same pattern as
-         * DEVICEQUERY). We store the raw pointer; v1000_process_rx
-         * invokes it on each RX frame with a SANA2CopyHookMsg. */
-        APTR hook = ioreq->ios2_Data;
-        if (!hook) hook = ioreq->ios2_StatData;
+        /* Phase 8d: install Roadshow's per-opener Sana2Hook. Per
+         * rolsen/amy_skeletons pattern and SANA-II Rev 7:
+         *   - Caller passes struct Sana2Hook* in ios2_Data
+         *   - ios2_DataLength >= 20 (min hook + methods list header)
+         *   - Sana2Hook has embedded struct Hook + Tag* s2h_Methods
+         *     (array of tag IDs the hook services, terminated with
+         *      TAG_END = 0)
+         * We store the &s2h_Hook (pointer to embedded Hook) in
+         * op->sana2_hook. Copy invocation via CallHookPkt is done in
+         * v1000_invoke_copy_to/from. */
+        struct Sana2Hook *hook = (struct Sana2Hook *)ioreq->ios2_Data;
+        if (!hook) hook = (struct Sana2Hook *)ioreq->ios2_StatData;
         if (!hook) {
             ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
             ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
             break;
         }
-        devBase->sana2hook = hook;
+        if (ioreq->ios2_DataLength && ioreq->ios2_DataLength < 20) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            ioreq->ios2_WireError    = 0;
+            break;
+        }
+        struct V1000Opener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = v1000_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+        if (!op) {
+            /* No opener yet — spec permits SANA2HOOK before Open in
+             * some flows, but we can't associate anything. Fail with
+             * a clean error so Roadshow falls back to tag-list. */
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
+            break;
+        }
+        op->sana2_hook         = &hook->s2h_Hook;
+        op->sana2_hook_methods = (ULONG *)hook->s2h_Methods;
+        /* Success — Roadshow will now use this hook for Copy*Buff. */
         break;
     }
 

@@ -253,6 +253,16 @@ struct V1000Opener
     ULONG           copy_to_tag;
     ULONG           copy_from_tag;
 
+    /* Phase 8d: preferred delivery mechanism — Roadshow-installed
+     * Sana2Hook (via S2_SANA2HOOK command). When set, it takes
+     * precedence over the tag-list copy_to_buff / copy_from_buff.
+     * The hook is invoked with a SANA2CopyHookMsg (schm_Method =
+     * S2_CopyToBuff or S2_CopyFromBuff) via IUtility->CallHookPkt.
+     * `sana2_hook_methods` mirrors s2h_Methods so we know which
+     * operations the hook advertises support for. */
+    struct Hook    *sana2_hook;
+    ULONG          *sana2_hook_methods;
+
     /* Phase 6k: queue of CMD_READ requests waiting for a frame.
      * BeginIO enqueues, unit task dequeues + delivers via CopyToBuff.
      * IORequest's io_Message.mn_Node fits as-is on this list. */
