@@ -1972,16 +1972,12 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
              * the physical MAC on the wire won't actually change until we
              * wire the write. */
         }
-        devBase->state = V1000_STATE_CONFIGURED;
-        /* PHASE 7r: pack(2) DEVICEQUERY landed. Boot succeeds without
-         * guru — Roadshow's OpenDevice on us fails ("Device/unit failed
-         * to open") for reasons TBD, but that's a separate issue and
-         * doesn't crash the guest. Manual AddNetInterface + auto-online
-         * still gurus though. Leaving state=CONFIGURED baseline while
-         * we investigate boot-time OpenDevice failure. */
-        /* v1000_online_hw(devBase); */
-        /* devBase->state = V1000_STATE_ONLINE; */
-        /* v1000_signal_event(devBase, S2EVENT_ONLINE); */
+        /* PHASE 7t: auto-online with pack(2) DEVICEQUERY now
+         * delivering correct MTU=1500 to Roadshow. Prior gurus were
+         * caused by MTU=0/garbage from the wrong-offset writes. */
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
 #if 0
         devBase->state = V1000_STATE_CONFIGURED;
         /* PHASE 7o GDB SESSION FINDING: found interpreter function
