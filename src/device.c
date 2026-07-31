@@ -1908,6 +1908,21 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
              * wire the write. */
         }
         devBase->state = V1000_STATE_CONFIGURED;
+        /* PHASE 7p ROOT CAUSE IDENTIFIED — see docs/DEBUGGING.md
+         * "Phase 7p: rolsen74 skeleton unlocks the root cause".
+         *
+         * Roadshow's DSI guru is caused by our BeginIO handling
+         * everything INLINE in the caller's task context. The
+         * canonical OS4 SANA-II pattern (per rolsen74/amy_skeletons)
+         * is: BeginIO does nothing but PutMsg the ioreq to a per-
+         * unit process; the process handles it in its own task
+         * context. That way v1000_online_hw() (which unmasks IRQs)
+         * doesn't fire while Roadshow's task is blocked in our code.
+         *
+         * Refactor to that architecture is the real fix; keep
+         * state=CONFIGURED baseline in the meantime. */
+#if 0
+        devBase->state = V1000_STATE_CONFIGURED;
         /* PHASE 7o GDB SESSION FINDING: found interpreter function
          * entry at 0x018559b0 (takes r3=input-ptr, r4=obj-with-tables).
          *   r5 = *(r4+0)     — state table base
@@ -1959,6 +1974,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
          * where r8 initially points. Likely a Roadshow-internal
          * parser (regex/DFA for something — DNS names? config? IP
          * expression?) invoked once state=ONLINE lets it run. */
+#endif
 #endif
         /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
          * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
