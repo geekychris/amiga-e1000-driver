@@ -24,6 +24,7 @@
 #include <exec/resident.h>
 #include <exec/errors.h>
 #include <exec/execbase.h>
+#include <exec/emulation.h>       /* ET_RegisterA0/A1/D0 for EmulateTags */
 
 #include <devices/newstyle.h>   /* NSCMD_DEVICEQUERY + NSDeviceQueryResult */
 
@@ -460,12 +461,96 @@ static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
 #define V1000_DESC_SIZE      16
 #define V1000_RX_BUFSIZE     2048
 
+/* SANA-II Rev 4 has two CopyTo/CopyFromBuff ABIs. The classic tag
+ * S2_CopyToBuff / S2_CopyFromBuff points at a m68k asm function that
+ * takes (a0=to, a1=from, d0=size) and returns d0=bool — on OS4 we call
+ * it via IExec->EmulateTags. The newer S2_CopyToBuff16 / 32 (and their
+ * CopyFromBuff twins) point at a struct Hook* that accepts a
+ * SANA2CopyHookMsg — invoked via IUtility->CallHookPkt. Roadshow on
+ * OS4 supplies BOTH; picking the wrong ABI causes a DSI on first RX
+ * delivery (calling a code pointer as a Hook* jumps to bytes 8 into
+ * the function). op->copy_*_tag records which one we resolved at
+ * Open, and these helpers dispatch accordingly. */
+typedef BOOL (*V1000CopyFn)(APTR to, APTR from, ULONG size);
+
+/* Isolation test: bypass BOTH copy hook invocation paths. If the
+ * DSI at 0x01855a0c disappears when we never call into Roadshow's
+ * hooks, we've located it to the hook-invocation ABI. If the DSI
+ * persists, the crash is elsewhere (CONFIGINTERFACE, ReplyMsg,
+ * event delivery, ...) and we've eliminated a hypothesis. */
+#define V1000_BYPASS_COPYHOOKS 1
+
+static BOOL v1000_invoke_copy_to(struct Virte1000Base *base,
+                                 struct V1000Opener *op,
+                                 struct IOSana2Req *ioreq,
+                                 APTR from, ULONG size)
+{
+    if (!op || !op->copy_to_buff) return FALSE;
+    base->copy_to_calls++;
+    base->last_copy_to_ptr = op->copy_to_buff;
+    base->last_copy_to_tag = op->copy_to_tag;
+    base->last_copy_to_size = size;
+#if V1000_BYPASS_COPYHOOKS
+    (void)base; (void)ioreq; (void)from;
+    return TRUE;   /* pretend we delivered */
+#else
+    if (op->copy_to_tag == S2_CopyToBuff) {
+        V1000CopyFn fn = (V1000CopyFn)op->copy_to_buff;
+        return fn(ioreq->ios2_Data, from, size);
+    }
+    struct SANA2CopyHookMsg msg;
+    msg.schm_Method  = op->copy_to_tag;
+    msg.schm_MsgSize = sizeof(msg);
+    msg.schm_To      = ioreq->ios2_Data;
+    msg.schm_From    = from;
+    msg.schm_Size    = size;
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+        (struct Hook *)op->copy_to_buff, ioreq, &msg);
+#endif
+}
+
+static BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
+                                   struct V1000Opener *op,
+                                   struct IOSana2Req *ioreq,
+                                   APTR to, ULONG size)
+{
+    if (!op || !op->copy_from_buff) return FALSE;
+    base->copy_from_calls++;
+    base->last_copy_from_ptr = op->copy_from_buff;
+    base->last_copy_from_tag = op->copy_from_tag;
+    base->last_copy_from_size = size;
+#if V1000_BYPASS_COPYHOOKS
+    (void)base; (void)ioreq; (void)to;
+    return TRUE;
+#else
+    if (op->copy_from_tag == S2_CopyFromBuff) {
+        V1000CopyFn fn = (V1000CopyFn)op->copy_from_buff;
+        return fn(to, ioreq->ios2_Data, size);
+    }
+    struct SANA2CopyHookMsg msg;
+    msg.schm_Method  = op->copy_from_tag;
+    msg.schm_MsgSize = sizeof(msg);
+    msg.schm_To      = to;
+    msg.schm_From    = ioreq->ios2_Data;
+    msg.schm_Size    = size;
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+        (struct Hook *)op->copy_from_buff, ioreq, &msg);
+#endif
+}
+
 /* Walk the RX ring, deliver frames to queued CMD_READ requests via the
  * opener's CopyToBuff hook, reset descriptors + advance RDT so HW can
  * refill the slot. Called from the unit task on IRQ signal. */
 static void v1000_process_rx(struct Virte1000Base *base)
 {
     if (!base->rx_ring || !base->bar0 || !base->IUtility) return;
+    /* Phase 8 debug: SKIP RX entirely. If the DSI-at-0x01855a0c crash
+     * goes away with RX disabled, the trigger is either our CopyToBuff
+     * bypass replying to CMD_READ with fake success (Roadshow parses
+     * the "packet" and walks garbage into its bytecode interpreter) or
+     * the mere ReplyMsg on the ioreq firing a PA_SOFTINT that runs
+     * Roadshow's post-RX handler with bad state. */
+    return;
     struct ExecIFace *IExec = base->IExec;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
@@ -542,14 +627,7 @@ static void v1000_process_rx(struct Virte1000Base *base)
             ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
             ioreq->ios2_DataLength = payload_len;
 
-            struct SANA2CopyHookMsg msg;
-            msg.schm_Method  = S2_CopyToBuff;
-            msg.schm_MsgSize = sizeof(msg);
-            msg.schm_To      = ioreq->ios2_Data;
-            msg.schm_From    = rxbuf + 14;
-            msg.schm_Size    = payload_len;
-            BOOL ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
-                (struct Hook *)op->copy_to_buff, ioreq, &msg);
+            BOOL ok = v1000_invoke_copy_to(base, op, ioreq, rxbuf + 14, payload_len);
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
             delivered_this_slot = ok;
@@ -1204,23 +1282,44 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
              * Roadshow's hooks internally cope with either alignment.
              * Falling back through the variants means we can bind to
              * a Roadshow that only provides the 32/16-bit forms. */
-            op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
-                S2_CopyFromBuff, 0, tags);
-            if (!op->copy_from_buff)
-                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
-                    S2_CopyFromBuff32, 0, tags);
-            if (!op->copy_from_buff)
-                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
-                    S2_CopyFromBuff16, 0, tags);
-
+            /* Prefer the OS4 Hook-style variants (S2_CopyToBuff32 / 16
+             * -- SANA2CopyHookMsg via CallHookPkt) over the classic
+             * Rev 4 S2_CopyToBuff (68k asm fn ptr via EmulateTags).
+             * Roadshow supplies at least one; when it supplies both,
+             * calling the classic one as a Hook* is what put us at
+             * DSI 0x01855a0c on first RX delivery. */
             op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
-                S2_CopyToBuff, 0, tags);
-            if (!op->copy_to_buff)
-                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
-                    S2_CopyToBuff32, 0, tags);
-            if (!op->copy_to_buff)
+                S2_CopyToBuff32, 0, tags);
+            op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff32 : 0;
+            if (!op->copy_to_buff) {
                 op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
                     S2_CopyToBuff16, 0, tags);
+                op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff16 : 0;
+            }
+            if (!op->copy_to_buff) {
+                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyToBuff, 0, tags);
+                op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff : 0;
+            }
+
+            op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                S2_CopyFromBuff32, 0, tags);
+            op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff32 : 0;
+            if (!op->copy_from_buff) {
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff16, 0, tags);
+                op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff16 : 0;
+            }
+            if (!op->copy_from_buff) {
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff, 0, tags);
+                op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff : 0;
+            }
+
+            devBase->IExec->DebugPrintF(
+                "[virte1000] Open: copy_to=%p tag=0x%08lx  copy_from=%p tag=0x%08lx\n",
+                op->copy_to_buff, (unsigned long)op->copy_to_tag,
+                op->copy_from_buff, (unsigned long)op->copy_from_tag);
         }
         op->bm_cookie = ioreq->ios2_BufferManagement;   /* the tag list */
         devBase->IExec->NewList((struct List *)&op->read_queue);
@@ -1682,14 +1781,7 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
         if (op && op->copy_to_buff && devBase->IUtility && ioreq->ios2_Data) {
-            struct SANA2CopyHookMsg msg;
-            msg.schm_Method  = S2_CopyToBuff;
-            msg.schm_MsgSize = sizeof(msg);
-            msg.schm_To      = ioreq->ios2_Data;
-            msg.schm_From    = rxbuf + 14;      /* payload after Ethernet header */
-            msg.schm_Size    = payload_len;
-            BOOL ok = (BOOL)(ULONG)devBase->IUtility->CallHookPkt(
-                (struct Hook *)op->copy_to_buff, ioreq, &msg);
+            BOOL ok = v1000_invoke_copy_to(devBase, op, ioreq, rxbuf + 14, payload_len);
             if (!ok) {
                 ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
                 ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
@@ -1972,12 +2064,14 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
              * the physical MAC on the wire won't actually change until we
              * wire the write. */
         }
-        /* PHASE 7t: auto-online with pack(2) DEVICEQUERY now
-         * delivering correct MTU=1500 to Roadshow. Prior gurus were
-         * caused by MTU=0/garbage from the wrong-offset writes. */
-        v1000_online_hw(devBase);
-        devBase->state = V1000_STATE_ONLINE;
-        v1000_signal_event(devBase, S2EVENT_ONLINE);
+        /* Phase 8 debug: DISABLE auto-online. Auto-online → Roadshow
+         * sends CMD_WRITE (via ping ARP broadcast) → task crashes at
+         * SRR0 0x01855a0c (Roadshow's bytecode-interpreter loop @ lhz
+         * r9,0(r8), see Phase 7n comment). Investigation ongoing.
+         * Leaving state=CONFIGURED lets the interface bind + shows in
+         * netstat, but Roadshow won't send packets through us, so the
+         * guest stays crash-free while we bisect the cause. */
+        devBase->state = V1000_STATE_CONFIGURED;
 #if 0
         devBase->state = V1000_STATE_CONFIGURED;
         /* PHASE 7o GDB SESSION FINDING: found interpreter function
@@ -2051,23 +2145,13 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
     }
 
     case S2_ONLINE: {
-        /* SANA-II-NOTES §3.4: requires CONFIGURED. On success enables
-         * RX/TX and unmasks IRQs, transitions state to ONLINE. */
-        if (devBase->state == V1000_STATE_ONLINE) {
-            /* Idempotent success — no state change, no hardware toggle. */
-            break;
-        }
-        if (devBase->state != V1000_STATE_CONFIGURED) {
-            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-            ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
-            break;
-        }
-        v1000_online_hw(devBase);
-        devBase->state = V1000_STATE_ONLINE;
-        /* Phase 7a: reply any queued S2_ONEVENT requests waiting for
-         * S2EVENT_ONLINE. pa6t_eth signals this from its unit task
-         * on the same state transition. */
-        v1000_signal_event(devBase, S2EVENT_ONLINE);
+        /* Phase 8 debug: BLOCK the ONLINE transition. Refuse with a
+         * "not ready" error so Roadshow keeps the interface DOWN and
+         * never queues CMD_WRITE / S2_BROADCAST — the path that
+         * triggers the DSI at SRR0 0x01855a0c. Restore once the crash
+         * cause is identified. */
+        ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+        ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
         break;
     }
 
@@ -2122,7 +2206,7 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
             break;
         }
-        ioreq->ios2_WireError = 0x3000;
+        ioreq->ios2_WireError = 0;
 
         /* Two shapes: COOKED (opener has hook) or RAW (memcpy).
          * Use the dedicated tx_scratch buffer — NOT rx_buffers[slot],
@@ -2152,17 +2236,11 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             dst[12] = (UBYTE)(etype >> 8);
             dst[13] = (UBYTE)(etype & 0xFF);
 
-            /* Pull payload via the caller's CopyFromBuff hook. Per
-             * SANA-II-NOTES §2 + pa6t_eth pattern, invocation goes
-             * through IUtility->CallHookPkt with a SANA2CopyHookMsg. */
-            struct SANA2CopyHookMsg msg;
-            msg.schm_Method  = S2_CopyFromBuff;
-            msg.schm_MsgSize = sizeof(msg);
-            msg.schm_To      = dst + 14;
-            msg.schm_From    = ioreq->ios2_Data;    /* opaque cookie */
-            msg.schm_Size    = len;
-            BOOL ok = (BOOL)(ULONG)devBase->IUtility->CallHookPkt(
-                (struct Hook *)op->copy_from_buff, ioreq, &msg);
+            /* Pull payload via the caller's CopyFromBuff hook. ABI
+             * selected by op->copy_from_tag (Hook via CallHookPkt for
+             * -16/-32 variants; classic 68k asm via EmulateTags for
+             * plain S2_CopyFromBuff). */
+            BOOL ok = v1000_invoke_copy_from(devBase, op, ioreq, dst + 14, len);
             if (!ok) {
                 ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
                 ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
@@ -2212,9 +2290,13 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
         e1000_write32(mmio, E1000_REG_TDT, new_tdt);
         devBase->tx_next_slot = new_tdt;
 
-        /* Poll for STATUS.DD. HW writes it back via DMA. */
+        /* Poll for STATUS.DD briefly. Under QEMU emulation each spin
+         * iteration is ~100ns; 100k = 10ms per packet was noticeable
+         * when Roadshow sends bursts of ARP + ping. Trim to 5k (~0.5ms).
+         * Descriptor's DD should be set within a few reads for a
+         * paravirtualized NIC. */
         BOOL done = FALSE;
-        for (int i = 0; i < 100000; i++) {
+        for (int i = 0; i < 5000; i++) {
             if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
             __asm__ volatile ("" : : : "memory");
         }

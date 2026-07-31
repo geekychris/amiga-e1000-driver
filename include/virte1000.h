@@ -163,6 +163,19 @@ struct Virte1000Base
     volatile ULONG      process_rx_dd_seen;
     volatile ULONG      process_rx_delivered;
 
+    /* Debug counters for copy-hook isolation (Phase 8). Incremented on
+     * every v1000_invoke_copy_to/from entry BEFORE we (would) call the
+     * caller's function. last_* captures the pointer/tag/size of the
+     * most recent invocation for post-hoc inspection via DBG_STATUS. */
+    volatile ULONG      copy_to_calls;
+    volatile ULONG      copy_from_calls;
+    APTR                last_copy_to_ptr;
+    APTR                last_copy_from_ptr;
+    ULONG               last_copy_to_tag;
+    ULONG               last_copy_from_tag;
+    ULONG               last_copy_to_size;
+    ULONG               last_copy_from_size;
+
     /* Phase 7a: snapshot of Roadshow's Sana2DeviceQuery buffer, taken
      * INSIDE our S2_DEVICEQUERY handler. `deviceq_before` = raw bytes
      * of *q from position 0..47 BEFORE we write anything; `deviceq_after`
@@ -219,6 +232,14 @@ struct V1000Opener
      * (e.g. RAW-only clients like testtx). */
     APTR            copy_from_buff;
     APTR            copy_to_buff;
+    /* Which tag we resolved these from. 0 = none, else one of
+     * S2_CopyToBuff / S2_CopyToBuff16 / S2_CopyToBuff32. Used to
+     * decide the invocation ABI: the plain S2_CopyToBuff is a
+     * Rev 4 68k function called via EmulateTags; the -16/-32
+     * variants (per OS4 sana2.h SANA2CopyHookMsg) are Hook* called
+     * via CallHookPkt. Tag value fits in a ULONG. */
+    ULONG           copy_to_tag;
+    ULONG           copy_from_tag;
 
     /* Phase 6k: queue of CMD_READ requests waiting for a frame.
      * BeginIO enqueues, unit task dequeues + delivers via CopyToBuff.
