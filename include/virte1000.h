@@ -71,6 +71,15 @@ struct Virte1000Base
      * address when an inbound frame arrived during outbound send. */
     APTR    tx_scratch;
     ULONG   tx_scratch_phys;
+    /* Phase 9a: raw (pre-alignment) AllocMem pointers so FreeMem knows
+     * what to release. Filled when using the AllocMem+manual-align
+     * path (from virtio_net Phase 10j-15 lesson — AllocVecTags with
+     * AVT_Contiguous+AVT_PhysicalAlignment silently returns NULL for
+     * KB-sized blocks on sam460ex). NULL if unused. */
+    APTR    rx_ring_raw;      ULONG rx_ring_raw_size;
+    APTR    tx_ring_raw;      ULONG tx_ring_raw_size;
+    APTR    rx_buffers_raw;   ULONG rx_buffers_raw_size;
+    APTR    tx_scratch_raw;   ULONG tx_scratch_raw_size;
 
     /* Phase 5: PCI INTx interrupt handler. irq_installed guards Expunge
      * so we RemIntServer only if AddIntServer succeeded. irq_counter and

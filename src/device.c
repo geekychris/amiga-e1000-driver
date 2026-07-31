@@ -1101,27 +1101,24 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         ULONG ring_bytes = V1000_RING_ENTRIES * V1000_DESC_SIZE;
         ULONG buf_bytes  = V1000_RING_ENTRIES * V1000_RX_BUFSIZE;
 
-        devBase->rx_ring = iexec->AllocVecTags(ring_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-        devBase->tx_ring = iexec->AllocVecTags(ring_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-        devBase->rx_buffers = iexec->AllocVecTags(buf_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
+        /* Lessons from virtio_net Phase 10j-15:
+         * AllocVecTags(size, AVT_Contiguous, AVT_PhysicalAlignment,
+         * AVT_Alignment=N) silently returns NULL for KB-sized blocks on
+         * sam460ex. Plain AllocMem returns aligned memory reliably.
+         * Over-allocate by alignment and manually align. */
+        ULONG rx_ring_alloc = ring_bytes + 16;
+        ULONG tx_ring_alloc = ring_bytes + 16;
+        ULONG buf_alloc     = buf_bytes  + 16;
+        devBase->rx_ring_raw = iexec->AllocMem(rx_ring_alloc, MEMF_KICK | MEMF_CLEAR);
+        devBase->tx_ring_raw = iexec->AllocMem(tx_ring_alloc, MEMF_KICK | MEMF_CLEAR);
+        /* buf_bytes = 32 KB — MEMF_KICK region can hold this alongside rings. */
+        devBase->rx_buffers_raw = iexec->AllocMem(buf_alloc, MEMF_KICK | MEMF_CLEAR);
+        devBase->rx_ring_raw_size = rx_ring_alloc;
+        devBase->tx_ring_raw_size = tx_ring_alloc;
+        devBase->rx_buffers_raw_size = buf_alloc;
+        devBase->rx_ring = devBase->rx_ring_raw ? (APTR)(((ULONG)devBase->rx_ring_raw + 15UL) & ~15UL) : NULL;
+        devBase->tx_ring = devBase->tx_ring_raw ? (APTR)(((ULONG)devBase->tx_ring_raw + 15UL) & ~15UL) : NULL;
+        devBase->rx_buffers = devBase->rx_buffers_raw ? (APTR)(((ULONG)devBase->rx_buffers_raw + 15UL) & ~15UL) : NULL;
 
         LOGF(log, (CONST_STRPTR)"rings: rx_ring=%p tx_ring=%p rx_buffers=%p (each %lu, buf pool %lu)\n",
              devBase->rx_ring, devBase->tx_ring, devBase->rx_buffers,
@@ -1156,13 +1153,13 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         /* Dedicated TX scratch — separate from rx_buffers so HW's
          * TX-read DMA doesn't race with RX-write DMA at the same phys
          * address. 2 KB is enough for one full-size Ethernet frame. */
-        devBase->tx_scratch = iexec->AllocVecTags(V1000_RX_BUFSIZE,
-            AVT_Type,           MEMF_SHARED,
-            AVT_Contiguous,     TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,      16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
+        /* Lesson from virtio_net Phase 10j-15: plain AllocMem+MEMF_KICK. */
+        ULONG scratch_alloc = V1000_RX_BUFSIZE + 16;
+        devBase->tx_scratch_raw = iexec->AllocMem(scratch_alloc, MEMF_KICK | MEMF_CLEAR);
+        devBase->tx_scratch_raw_size = scratch_alloc;
+        devBase->tx_scratch = devBase->tx_scratch_raw
+            ? (APTR)(((ULONG)devBase->tx_scratch_raw + 15UL) & ~15UL)
+            : NULL;
         if (devBase->tx_scratch) {
             devBase->tx_scratch_phys = v1000_dma_phys(iexec, devBase->tx_scratch,
                                                       V1000_RX_BUFSIZE, DMA_ReadFromRAM);
@@ -1529,10 +1526,12 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
             IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
 
-        if (devBase->tx_scratch) { IExec->FreeVec(devBase->tx_scratch); devBase->tx_scratch = NULL; }
-        if (devBase->rx_buffers) { IExec->FreeVec(devBase->rx_buffers); devBase->rx_buffers = NULL; }
-        if (devBase->tx_ring)    { IExec->FreeVec(devBase->tx_ring);    devBase->tx_ring    = NULL; }
-        if (devBase->rx_ring)    { IExec->FreeVec(devBase->rx_ring);    devBase->rx_ring    = NULL; }
+        /* Phase 9a: rings now allocated via AllocMem+manual-align.
+         * FreeMem the raw pre-alignment pointers. */
+        if (devBase->tx_scratch_raw) { IExec->FreeMem(devBase->tx_scratch_raw, devBase->tx_scratch_raw_size); devBase->tx_scratch_raw = NULL; devBase->tx_scratch = NULL; }
+        if (devBase->rx_buffers_raw) { IExec->FreeMem(devBase->rx_buffers_raw, devBase->rx_buffers_raw_size); devBase->rx_buffers_raw = NULL; devBase->rx_buffers = NULL; }
+        if (devBase->tx_ring_raw)    { IExec->FreeMem(devBase->tx_ring_raw,    devBase->tx_ring_raw_size);    devBase->tx_ring_raw    = NULL; devBase->tx_ring    = NULL; }
+        if (devBase->rx_ring_raw)    { IExec->FreeMem(devBase->rx_ring_raw,    devBase->rx_ring_raw_size);    devBase->rx_ring_raw    = NULL; devBase->rx_ring    = NULL; }
         if (devBase->bar0) {
             devBase->pciDevice->FreeResourceRange(devBase->bar0);
             devBase->bar0 = NULL;
