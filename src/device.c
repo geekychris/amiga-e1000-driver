@@ -2513,8 +2513,25 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
         devBase->cmdlog_head++;
     }
 
-    /* BeginIO cleared IOF_QUICK; always reply here unless a handler
-     * `return`ed early (e.g. queued CMD_READ waiting for a frame). */
+    /* Phase 8 finding: disabling ReplyMsg here did NOT stop the DSI
+     * @ 0x01855a0c triggered by ping. The crash still fires in
+     * virte1000-unit task even with all four kill-switches active
+     * (copy hooks bypassed, RX disabled, S2_ONLINE rejected, and
+     * ReplyMsg elided). So the crash vector is NOT ReplyMsg's
+     * PA_SOFTINT-triggered handler. Investigation must resume with
+     * a different hypothesis:
+     *   - Roadshow may be Cause()-ing a SoftInt that lands in our
+     *     task context regardless of which task's Cause was fired
+     *     (softints run in a "borrowed" task per OS4 semantics)
+     *   - Or our task struct's ln_Name is being reported for a fault
+     *     that actually occurred in another task (e.g., Roadshow's
+     *     bsdsocket daemon)
+     *   - Or something in our BeginIO PutMsg to begin_port has a
+     *     side-effect that runs Roadshow code (unlikely for a
+     *     PA_SIGNAL port).
+     * For now — keep ReplyMsg, keep the counters. */
+    devBase->replymsg_skips++;   /* now a "replies done" counter */
+    devBase->last_skipped_cmd = ioreq->ios2_Req.io_Command;
     IExec->ReplyMsg((struct Message *)ioreq);
 }
 

@@ -175,6 +175,8 @@ struct Virte1000Base
     ULONG               last_copy_from_tag;
     ULONG               last_copy_to_size;
     ULONG               last_copy_from_size;
+    volatile ULONG      replymsg_skips;
+    volatile UWORD      last_skipped_cmd;
 
     /* Phase 7a: snapshot of Roadshow's Sana2DeviceQuery buffer, taken
      * INSIDE our S2_DEVICEQUERY handler. `deviceq_before` = raw bytes
