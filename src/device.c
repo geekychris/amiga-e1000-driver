@@ -42,6 +42,36 @@
  * target isn't wired to the kernel serial channel and disappears; a file
  * we can read back via devbench's /api/file endpoint. */
 #define VIRTE1000_STATUS_FILE  "RAM:virte1000-init.log"
+#define VIRTE1000_TRACE_FILE   "RAM:virte1000-trace.log"
+
+/* Phase 8c: lazy trace-log opener. dos.library isn't reliably available
+ * at _manager_Init boot-time (Init runs early); attempt to open on
+ * first BeginIO instead. Safe to no-op if open fails — caller checks
+ * base->trace_fh before write. */
+static void v1000_trace_open(struct Virte1000Base *base)
+{
+    if (base->trace_fh) return;   /* already open */
+    if (!base->DOSBase) {
+        base->DOSBase = base->IExec->OpenLibrary("dos.library", 51);
+        if (!base->DOSBase) return;
+        base->IDOS = base->IExec->GetInterface(base->DOSBase, "main", 1, NULL);
+        if (!base->IDOS) {
+            base->IExec->CloseLibrary(base->DOSBase);
+            base->DOSBase = NULL;
+            return;
+        }
+    }
+    struct DOSIFace *IDOS = (struct DOSIFace *)base->IDOS;
+    base->trace_fh = IDOS->Open((CONST_STRPTR)VIRTE1000_TRACE_FILE, MODE_NEWFILE);
+}
+
+/* Phase 8c revert: TRACEF was hanging when called from BeginIO fast-
+ * path post-crash — dos.library Open() may block if there's an issue
+ * with the DOS handle lifecycle across task deaths. Compiled out
+ * entirely. cmdlog ring in Virte1000Base already records every
+ * dispatch and is readable via DBG_CMDLOG through the BeginIO
+ * fast-path (added at the same time as this). */
+#define TRACEF(base, ...) do { (void)(base); } while (0)
 
 /*
  * Manager Obtain/Release — reference counting on the interface itself.
@@ -1555,6 +1585,19 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
 
+    /* Phase 8c: fast-path DBG_STATUS + DBG_CMDLOG handling directly in
+     * BeginIO — no queueing to unit task. These commands are pure reads
+     * of Virte1000Base state and safe to run in the caller's context.
+     * Critical because if the unit task crashes, tests calling these
+     * commands via DoIO would hang forever waiting for the reply. */
+    UWORD cmd = ioreq->ios2_Req.io_Command;
+    if (cmd == V1000_DBG_STATUS || cmd == V1000_DBG_CMDLOG ||
+        cmd == V1000_DBG_DQBUF   || cmd == V1000_DBG_CFGBUF ||
+        cmd == V1000_DBG_DUMPTX) {
+        v1000_dispatch_ioreq(devBase, ioreq);
+        return;
+    }
+
     if (devBase->begin_port) {
         IExec->PutMsg(devBase->begin_port, (struct Message *)ioreq);
     } else {
@@ -1570,6 +1613,19 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
 static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *ioreq)
 {
     struct ExecIFace *IExec = devBase->IExec;
+
+    /* Phase 8c: log every dispatch entry so we can see the last
+     * command Roadshow sent before the crash. Read via /api/file
+     * after the guru appears. */
+    struct MsgPort *rp = ioreq->ios2_Req.io_Message.mn_ReplyPort;
+    TRACEF(devBase, "DISPATCH cmd=%u flags=0x%02x data=0x%08lx bm=0x%08lx rp=0x%08lx rp_flags=0x%02x rp_type=%u\n",
+        (unsigned)ioreq->ios2_Req.io_Command,
+        (unsigned)ioreq->ios2_Req.io_Flags,
+        (unsigned long)ioreq->ios2_Data,
+        (unsigned long)ioreq->ios2_BufferManagement,
+        (unsigned long)rp,
+        (unsigned)(rp ? rp->mp_Flags : 0),
+        (unsigned)(rp ? rp->mp_Node.ln_Type : 0));
 
     switch (ioreq->ios2_Req.io_Command) {
 
@@ -2532,7 +2588,13 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
      * For now — keep ReplyMsg, keep the counters. */
     devBase->replymsg_skips++;   /* now a "replies done" counter */
     devBase->last_skipped_cmd = ioreq->ios2_Req.io_Command;
+    TRACEF(devBase, "REPLY   cmd=%u ioerr=%d wire=0x%08lx\n",
+        (unsigned)ioreq->ios2_Req.io_Command,
+        (int)ioreq->ios2_Req.io_Error,
+        (unsigned long)ioreq->ios2_WireError);
     IExec->ReplyMsg((struct Message *)ioreq);
+    TRACEF(devBase, "REPLYED cmd=%u (returned from ReplyMsg)\n",
+        (unsigned)ioreq->ios2_Req.io_Command);
 }
 
 LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)

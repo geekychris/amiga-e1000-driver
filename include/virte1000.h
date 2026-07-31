@@ -178,6 +178,16 @@ struct Virte1000Base
     volatile ULONG      replymsg_skips;
     volatile UWORD      last_skipped_cmd;
 
+    /* Phase 8c: persistent trace log — dos.library file we append every
+     * dispatch entry + reply. Opened lazily on first BeginIO (dos.library
+     * isn't available at _manager_Init on OS4 boot). Survives task
+     * crashes since it lives on disk, so post-crash we can read the log
+     * and see which io_Command was the last one dispatched. */
+    struct Library     *DOSBase;
+    APTR                IDOS;         /* struct DOSIFace* — void APTR to avoid header pull */
+    BPTR                trace_fh;
+    volatile ULONG      trace_seq;
+
     /* Phase 7a: snapshot of Roadshow's Sana2DeviceQuery buffer, taken
      * INSIDE our S2_DEVICEQUERY handler. `deviceq_before` = raw bytes
      * of *q from position 0..47 BEFORE we write anything; `deviceq_after`
