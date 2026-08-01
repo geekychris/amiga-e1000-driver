@@ -2363,11 +2363,14 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             for (ULONG i = 0; i < len; i++) dst[i] = src[i];
         }
 
-        /* Physical addr of the TX scratch. StartDMA also flushes the
-         * data cache — critical since we just wrote the frame bytes.
-         * Pair with EndDMA after we're sure HW is done. */
+        /* Physical addr of the TX scratch. Use the phys we already
+         * captured at Init — calling StartDMA again on the same buffer
+         * without a matching EndDMA returns 0 (StartDMA doesn't nest).
+         * Just do a manual CacheClearE to ensure the frame bytes we
+         * wrote above reach RAM before the doorbell. */
         ULONG frame_len_io = len;
-        uint32 buf_phys = v1000_dma_phys(IExec, dst, len, DMA_ReadFromRAM);
+        uint32 buf_phys = devBase->tx_scratch_phys;
+        IExec->CacheClearE(dst, len, CACRF_ClearD);
         if (!buf_phys) {
             ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
             break;
@@ -2403,8 +2406,9 @@ static void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Re
             __asm__ volatile ("" : : : "memory");
         }
 
-        /* Release the DMA hold on the frame buffer. */
-        IExec->EndDMA(dst, frame_len_io, DMA_ReadFromRAM);
+        /* No EndDMA — we never StartDMA'd here (tx_scratch's StartDMA
+         * from Init stays active for the lifetime of the driver). */
+        (void)frame_len_io;
         /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
          * TCTL — so testtx can see what HW did. */
         uint32 tdh_now  = e1000_read32(mmio, E1000_REG_TDH);
