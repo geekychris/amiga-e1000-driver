@@ -345,4 +345,49 @@ struct V1000Opener
                                      * ios2_Data[80..159] = after
                                      * Caller supplies >=160-byte buf. */
 
+#include "e1000_regs.h"
+
+/* Forward Function Declarations for Modular Driver Architecture */
+uint32 _manager_Obtain(struct DeviceManagerInterface *Self);
+uint32 _manager_Release(struct DeviceManagerInterface *Self);
+
+struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Interface *exec);
+struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
+                                    struct IOSana2Req *ioreq,
+                                    ULONG unitNum, ULONG flags);
+BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
+BPTR _manager_Expunge(struct DeviceManagerInterface *Self);
+void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
+LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
+
+/* Hardware & PCI Interface */
+BOOL  v1000_pci_find(struct Virte1000Base *base);
+BOOL  v1000_hw_init(struct Virte1000Base *base);
+void  v1000_hw_cleanup(struct Virte1000Base *base);
+void  v1000_online_hw(struct Virte1000Base *base);
+void  v1000_offline_hw(struct Virte1000Base *base);
+uint32 v1000_dma_phys(struct ExecIFace *IExec, void *virt, ULONG size, ULONG flags);
+
+/* Interrupt Handler */
+BOOL   v1000_irq_install(struct Virte1000Base *base);
+void   v1000_irq_remove(struct Virte1000Base *base);
+uint32 v1000_isr(struct ExceptionContext *ctx, struct ExecBase *ExecBase, APTR userData);
+
+/* RX / TX Processing */
+void v1000_process_rx(struct Virte1000Base *base);
+BOOL v1000_invoke_copy_to(struct Virte1000Base *base, struct V1000Opener *op, struct IOSana2Req *ioreq, APTR data, ULONG len);
+BOOL v1000_transmit_packet(struct Virte1000Base *base, struct V1000Opener *op, struct IOSana2Req *ioreq);
+BOOL v1000_invoke_copy_from(struct Virte1000Base *base, struct V1000Opener *op, struct IOSana2Req *ioreq, APTR data, ULONG len);
+
+/* Task & Command Handling */
+BOOL v1000_task_start(struct Virte1000Base *base, struct ExecIFace *iexec);
+void v1000_task_stop(struct Virte1000Base *base, struct ExecIFace *IExec);
+void v1000_task_body(void);
+struct V1000Opener *v1000_find_opener(struct Virte1000Base *base, APTR bm_cookie);
+void v1000_signal_event(struct Virte1000Base *base, ULONG event_mask);
+void v1000_dispatch_ioreq(struct Virte1000Base *base, struct IOSana2Req *ioreq);
+
+/* Diagnostics & Trace */
+void v1000_trace_open(struct Virte1000Base *base);
+
 #endif
