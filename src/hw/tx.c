@@ -120,11 +120,12 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     e1000_write32(mmio, E1000_REG_TDT, new_tdt);
     devBase->tx_next_slot = new_tdt;
 
+    ULONG expected_tdh = (slot + 1) % V1000_RING_ENTRIES;
     BOOL done = FALSE;
     for (int i = 0; i < 5000; i++) {
         IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, CACRF_InvalidateD);
         uint32 tdh_check = e1000_read32(mmio, E1000_REG_TDH);
-        if ((d[12] & E1000_TXD_STAT_DD) || (tdh_check != slot)) {
+        if ((d[12] & E1000_TXD_STAT_DD) || (tdh_check == expected_tdh)) {
             done = TRUE;
             break;
         }
