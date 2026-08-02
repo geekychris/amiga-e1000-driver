@@ -62,14 +62,43 @@ void v1000_task_body(void)
 
     IExec->DebugPrintF("[virte1000] UnitTask: shutting down\n");
 
+    /* Drain remaining messages on begin_port before deleting port */
     if (base->begin_port) {
+        struct Message *msg;
+        while ((msg = IExec->GetMsg(base->begin_port)) != NULL) {
+            struct IOSana2Req *ioreq = (struct IOSana2Req *)msg;
+            ioreq->ios2_Req.io_Error = IOERR_ABORTED;
+            IExec->ReplyMsg(msg);
+        }
         IExec->FreeSysObject(ASOT_PORT, base->begin_port);
         base->begin_port = NULL;
         base->begin_port_mask = 0;
     }
+
+    /* Abort all pending read and event requests across all openers */
+    IExec->ObtainSemaphore(&base->opener_lock);
+    struct V1000Opener *op;
+    for (op = (struct V1000Opener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ;
+         op = (struct V1000Opener *)op->node.mln_Succ) {
+        struct Node *node;
+        while ((node = IExec->RemHead((struct List *)&op->read_queue)) != NULL) {
+            struct IOSana2Req *pending = (struct IOSana2Req *)node;
+            pending->ios2_Req.io_Error = IOERR_ABORTED;
+            IExec->ReplyMsg((struct Message *)pending);
+        }
+        while ((node = IExec->RemHead((struct List *)&op->event_queue)) != NULL) {
+            struct IOSana2Req *pending = (struct IOSana2Req *)node;
+            pending->ios2_Req.io_Error = IOERR_ABORTED;
+            IExec->ReplyMsg((struct Message *)pending);
+        }
+    }
+    IExec->ReleaseSemaphore(&base->opener_lock);
+
     IExec->FreeSignal(sig);
     base->unit_signal_mask = 0;
     base->unit_task = NULL;
+    IExec->DebugPrintF("[virte1000] UnitTask: shutdown complete\n");
 }
 
 BOOL v1000_task_start(struct Virte1000Base *base, struct ExecIFace *iexec)

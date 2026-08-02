@@ -556,6 +556,8 @@ LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
 
     if (!ioreq) return -1;
 
+    IExec->DebugPrintF("[virte1000] AbortIO: ioreq=%p cmd=%u\n", ioreq, ioreq->ios2_Req.io_Command);
+
     IExec->ObtainSemaphore(&devBase->opener_lock);
     struct V1000Opener *op;
     for (op = (struct V1000Opener *)devBase->opener_list.mlh_Head;
@@ -569,6 +571,7 @@ LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                 IExec->ReleaseSemaphore(&devBase->opener_lock);
                 ioreq->ios2_Req.io_Error = IOERR_ABORTED;
                 IExec->ReplyMsg((struct Message *)ioreq);
+                IExec->DebugPrintF("[virte1000] AbortIO: aborted read_queue ioreq=%p\n", ioreq);
                 return 0;
             }
         }
@@ -578,10 +581,32 @@ LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
                 IExec->ReleaseSemaphore(&devBase->opener_lock);
                 ioreq->ios2_Req.io_Error = IOERR_ABORTED;
                 IExec->ReplyMsg((struct Message *)ioreq);
+                IExec->DebugPrintF("[virte1000] AbortIO: aborted event_queue ioreq=%p\n", ioreq);
                 return 0;
             }
         }
     }
     IExec->ReleaseSemaphore(&devBase->opener_lock);
+
+    /* Also check begin_port message list under Forbid */
+    if (devBase->begin_port) {
+        IExec->Forbid();
+        struct Node *curr;
+        for (curr = devBase->begin_port->mp_MsgList.lh_Head;
+             curr->ln_Succ;
+             curr = curr->ln_Succ) {
+            if (curr == (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node) {
+                IExec->Remove(curr);
+                IExec->Permit();
+                ioreq->ios2_Req.io_Error = IOERR_ABORTED;
+                IExec->ReplyMsg((struct Message *)ioreq);
+                IExec->DebugPrintF("[virte1000] AbortIO: aborted begin_port ioreq=%p\n", ioreq);
+                return 0;
+            }
+        }
+        IExec->Permit();
+    }
+
+    IExec->DebugPrintF("[virte1000] AbortIO: ioreq=%p not found\n", ioreq);
     return -1;
 }
