@@ -21,7 +21,7 @@ uint32 v1000_isr(struct ExceptionContext *ctx, struct ExecBase *sysbase, APTR is
     base->irq_counter++;
     base->last_icr = icr;
 
-    if ((icr & (1U << 7)) && base->unit_task && base->unit_signal_mask) {
+    if (base->unit_task && base->unit_signal_mask) {
         struct ExecIFace *IExec = base->IExec;
         IExec->Signal(base->unit_task, base->unit_signal_mask);
     }

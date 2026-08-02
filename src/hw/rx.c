@@ -89,7 +89,7 @@ void v1000_process_rx(struct Virte1000Base *base)
         }
         IExec->ReleaseSemaphore(&base->opener_lock);
 
-        if (ioreq && op && op->copy_to_buff && ioreq->ios2_Data) {
+        if (ioreq && op && (op->copy_to_buff || op->sana2_hook) && ioreq->ios2_Data) {
             for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
             for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = rxbuf[i];
             ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
@@ -99,6 +99,13 @@ void v1000_process_rx(struct Virte1000Base *base)
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
             delivered_this_slot = ok;
+
+            IExec->DebugPrintF("[virte1000] RX: slot=%d frame_len=%lu payload=%lu ptype=0x%04lx delivered=%d\n",
+                               slot, frame_len, payload_len, (unsigned long)ioreq->ios2_PacketType, (int)ok);
+        } else if (ioreq) {
+            IExec->DebugPrintF("[virte1000] RX: slot=%d skipped (op=%p hook=%p copy_to=%p data=%p)\n",
+                               slot, op, op ? op->sana2_hook : NULL,
+                               op ? op->copy_to_buff : NULL, ioreq ? ioreq->ios2_Data : NULL);
         }
         if (delivered_this_slot) base->process_rx_delivered++;
 
