@@ -427,6 +427,25 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
         break;
     }
 
+    case S2_GETGLOBALSTATS: {
+        struct Sana2DeviceStats *s = (struct Sana2DeviceStats *)ioreq->ios2_StatData;
+        if (!s) s = (struct Sana2DeviceStats *)ioreq->ios2_Data;
+        if (!s) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+            break;
+        }
+        s->PacketsReceived      = devBase->copy_to_calls;
+        s->PacketsSent          = devBase->copy_from_calls;
+        s->BadData              = 0;
+        s->Overruns             = 0;
+        s->UnknownTypesReceived = 0;
+        s->Reconfigurations     = devBase->config_call_count;
+        IExec->DebugPrintF("[virte1000] S2_GETGLOBALSTATS: rx=%lu tx=%lu\n",
+                           devBase->copy_to_calls, devBase->copy_from_calls);
+        break;
+    }
+
     case S2_ADDMULTICASTADDRESS:
     case S2_DELMULTICASTADDRESS:
     case S2_ADDMULTICASTADDRESSES:
