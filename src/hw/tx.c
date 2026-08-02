@@ -122,7 +122,12 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
 
     BOOL done = FALSE;
     for (int i = 0; i < 5000; i++) {
-        if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
+        IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, CACRF_InvalidateD);
+        uint32 tdh_check = e1000_read32(mmio, E1000_REG_TDH);
+        if ((d[12] & E1000_TXD_STAT_DD) || (tdh_check != slot)) {
+            done = TRUE;
+            break;
+        }
         __asm__ volatile ("" : : : "memory");
     }
 
@@ -130,6 +135,11 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     uint32 tdt_now  = e1000_read32(mmio, E1000_REG_TDT);
     uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
     UBYTE  stat_byte = d[12];
+
+    IExec->DebugPrintF("[virte1000] TX: slot=%lu len=%lu cooked=%d phys=0x%08lx TDH=%lu TDT=%lu stat=0x%02x done=%d\n",
+                       slot, len, (int)cooked, (unsigned long)buf_phys,
+                       (unsigned long)tdh_now, (unsigned long)tdt_now,
+                       (unsigned int)stat_byte, (int)done);
 
     ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
     ioreq->ios2_PacketType = tctl_now;
