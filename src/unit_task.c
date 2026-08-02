@@ -36,6 +36,7 @@ void v1000_task_body(void)
     base->begin_port_mask = 1UL << base->begin_port->mp_SigBit;
 
     base->task_ready_ok = TRUE;
+    IExec->DebugPrintF("[virte1000] UnitTask: started, begin_port=%p\n", base->begin_port);
     IExec->Signal(base->parent_task, base->parent_ready_mask);
 
     ULONG wait_mask = sig_mask | base->begin_port_mask | SIGBREAKF_CTRL_C;
@@ -46,6 +47,8 @@ void v1000_task_body(void)
         if (got & base->begin_port_mask) {
             struct IOSana2Req *req;
             while ((req = (struct IOSana2Req *)IExec->GetMsg(base->begin_port)) != NULL) {
+                IExec->DebugPrintF("[virte1000] UnitTask: dispatching req=%p cmd=%u\n",
+                                   req, req->ios2_Req.io_Command);
                 v1000_dispatch_ioreq(base, req);
             }
         }
@@ -56,6 +59,8 @@ void v1000_task_body(void)
             v1000_process_rx(base);
         }
     }
+
+    IExec->DebugPrintF("[virte1000] UnitTask: shutting down\n");
 
     if (base->begin_port) {
         IExec->FreeSysObject(ASOT_PORT, base->begin_port);

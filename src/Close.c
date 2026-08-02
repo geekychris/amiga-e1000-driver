@@ -14,6 +14,10 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *iore
     struct Virte1000Base *devBase = (struct Virte1000Base *)Self->Data.LibBase;
     BPTR seglist = (BPTR)NULL;
 
+    devBase->IExec->DebugPrintF("[virte1000] Close: ioreq=%p BM=%p openCnt=%lu\n",
+                                ioreq, ioreq ? ioreq->ios2_BufferManagement : NULL,
+                                (unsigned long)devBase->dev_Base.dd_Library.lib_OpenCnt);
+
     {
         struct ExecIFace *IExec = devBase->IExec;
         struct V1000Opener *op, *found = NULL;

@@ -9,6 +9,7 @@
 #include <exec/errors.h>
 #include <exec/ports.h>
 #include <devices/newstyle.h>
+#include <stddef.h>
 
 /* NSCMD_DEVICEQUERY supported-commands list. */
 static const UWORD v1000_supported_cmds[] = {
@@ -88,49 +89,27 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
 
         devBase->deviceq_call_count++;
         devBase->deviceq_sizeavailable = q->SizeAvailable;
-        {
-            volatile UBYTE *src = (volatile UBYTE *)q;
-            volatile UBYTE *dst = devBase->deviceq_before;
-            for (int i = 0; i < 48; i++) dst[i] = src[i];
-        }
 
-        UBYTE *raw = (UBYTE *)q;
-        ULONG size_wire = 34;
-        ULONG supply = 24;
-        if (supply > size_wire) supply = size_wire;
-        for (ULONG i = 0; i < supply; i++) raw[i] = 0;
+        ULONG avail  = q->SizeAvailable;
+        ULONG supply = sizeof(struct Sana2DeviceQuery);
+        if (avail > 0 && supply > avail) supply = avail;
 
-        #define S2DQ_WU16(off, val)   do { \
-            if (supply >= (off) + 2) { \
-                raw[(off) + 0] = (UBYTE)(((val) >> 8) & 0xFF); \
-                raw[(off) + 1] = (UBYTE)( (val)       & 0xFF); \
-            } } while (0)
-        #define S2DQ_WU32(off, val)   do { \
-            if (supply >= (off) + 4) { \
-                raw[(off) + 0] = (UBYTE)(((val) >> 24) & 0xFF); \
-                raw[(off) + 1] = (UBYTE)(((val) >> 16) & 0xFF); \
-                raw[(off) + 2] = (UBYTE)(((val) >>  8) & 0xFF); \
-                raw[(off) + 3] = (UBYTE)( (val)        & 0xFF); \
-            } } while (0)
+        q->SizeSupplied   = supply;
+        q->DevQueryFormat = 0;
+        q->DeviceLevel    = 0;
+        if (supply >= offsetof(struct Sana2DeviceQuery, AddrFieldSize) + sizeof(UWORD))
+            q->AddrFieldSize = 48;
+        if (supply >= offsetof(struct Sana2DeviceQuery, MTU) + sizeof(ULONG))
+            q->MTU = 1500;
+        if (supply >= offsetof(struct Sana2DeviceQuery, BPS) + sizeof(ULONG))
+            q->BPS = 1000000000UL;
+        if (supply >= offsetof(struct Sana2DeviceQuery, HardwareType) + sizeof(ULONG))
+            q->HardwareType = S2WireType_Ethernet;
+        if (supply >= offsetof(struct Sana2DeviceQuery, RawMTU) + sizeof(ULONG))
+            q->RawMTU = 1514;
 
-        S2DQ_WU32( 0, q->SizeAvailable);
-        S2DQ_WU32( 4, supply);
-        S2DQ_WU32( 8, 0);
-        S2DQ_WU32(12, 0);
-        S2DQ_WU16(16, 48);
-        S2DQ_WU32(18, 1500);
-        S2DQ_WU32(22, 1000000000UL);
-        S2DQ_WU32(26, S2WireType_Ethernet);
-        S2DQ_WU32(30, 1514);
-
-        #undef S2DQ_WU16
-        #undef S2DQ_WU32
-
-        {
-            volatile UBYTE *src = (volatile UBYTE *)q;
-            volatile UBYTE *dst = devBase->deviceq_after;
-            for (int i = 0; i < 48; i++) dst[i] = src[i];
-        }
+        IExec->DebugPrintF("[virte1000] S2_DEVICEQUERY: avail=%lu supply=%lu HWType=%lu MTU=%lu\n",
+                           avail, supply, (unsigned long)q->HardwareType, (unsigned long)q->MTU);
         break;
     }
 
@@ -330,6 +309,7 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
     }
 
     case S2_CONFIGINTERFACE: {
+        IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: state=%lu\n", devBase->state);
         devBase->config_call_count++;
         {
             volatile UBYTE *src = (volatile UBYTE *)ioreq;
@@ -341,22 +321,17 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
         for (int i = 0; i < 6; i++)
             if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
 
-        if (devBase->state != V1000_STATE_OFFLINE) {
-            if (!want_factory) {
-                BOOL same_mac = TRUE;
-                for (int i = 0; i < 6; i++)
-                    if (ioreq->ios2_SrcAddr[i] != devBase->mac[i]) {
-                        same_mac = FALSE; break;
-                    }
-                if (!same_mac) {
-                    ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-                    ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
-                    break;
+        if (!want_factory) {
+            BOOL same_mac = TRUE;
+            for (int i = 0; i < 6; i++)
+                if (ioreq->ios2_SrcAddr[i] != devBase->mac[i]) {
+                    same_mac = FALSE; break;
                 }
-            }
-            for (int i = 0; i < 6; i++) {
-                ioreq->ios2_SrcAddr[i] = devBase->mac[i];
-                ioreq->ios2_DstAddr[i] = 0xFF;
+            if (!same_mac) {
+                IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: MAC mismatch\n");
+                ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+                ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
+                break;
             }
         }
 
@@ -364,6 +339,15 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
             ioreq->ios2_SrcAddr[i] = devBase->mac[i];
             ioreq->ios2_DstAddr[i] = 0xFF;
         }
+
+        /* Per pa6t_eth: bring hardware online and transition to ONLINE */
+        if (devBase->state != V1000_STATE_ONLINE) {
+            v1000_online_hw(devBase);
+            devBase->state = V1000_STATE_ONLINE;
+            v1000_signal_event(devBase, S2EVENT_ONLINE);
+            IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: transitioned to ONLINE\n");
+        }
+
         {
             volatile UBYTE *src = (volatile UBYTE *)ioreq;
             volatile UBYTE *dst = devBase->config_after;
@@ -373,19 +357,18 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
     }
 
     case S2_ONLINE: {
-        if (devBase->state == V1000_STATE_ONLINE) break;
-        if (devBase->state != V1000_STATE_CONFIGURED) {
-            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-            ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
-            break;
+        IExec->DebugPrintF("[virte1000] S2_ONLINE: state=%lu\n", devBase->state);
+        if (devBase->state != V1000_STATE_ONLINE) {
+            v1000_online_hw(devBase);
+            devBase->state = V1000_STATE_ONLINE;
+            v1000_signal_event(devBase, S2EVENT_ONLINE);
+            IExec->DebugPrintF("[virte1000] S2_ONLINE: transitioned to ONLINE\n");
         }
-        v1000_online_hw(devBase);
-        devBase->state = V1000_STATE_ONLINE;
-        v1000_signal_event(devBase, S2EVENT_ONLINE);
         break;
     }
 
     case S2_OFFLINE: {
+        IExec->DebugPrintF("[virte1000] S2_OFFLINE: state=%lu\n", devBase->state);
         if (devBase->state == V1000_STATE_ONLINE) {
             v1000_offline_hw(devBase);
             devBase->state = V1000_STATE_CONFIGURED;
@@ -532,6 +515,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     ioreq->ios2_WireError    = 0;
 
     UWORD cmd = ioreq->ios2_Req.io_Command;
+    IExec->DebugPrintF("[virte1000] BeginIO: cmd=%u ioreq=%p\n", (unsigned int)cmd, ioreq);
     if (cmd == V1000_DBG_STATUS || cmd == V1000_DBG_CMDLOG ||
         cmd == V1000_DBG_DQBUF   || cmd == V1000_DBG_CFGBUF ||
         cmd == V1000_DBG_DUMPTX) {

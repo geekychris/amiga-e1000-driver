@@ -15,7 +15,8 @@ struct Virte1000Base *_manager_Open(struct DeviceManagerInterface *Self,
                                     ULONG unitNum, ULONG flags)
 {
     struct Virte1000Base *devBase = (struct Virte1000Base *)Self->Data.LibBase;
-    (void)flags;
+    devBase->IExec->DebugPrintF("[virte1000] Open: unitNum=%lu flags=0x%lx ioreq=%p BM=%p\n",
+                                unitNum, flags, ioreq, ioreq ? ioreq->ios2_BufferManagement : NULL);
 
     devBase->dev_Base.dd_Library.lib_OpenCnt++;
 
