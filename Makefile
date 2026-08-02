@@ -3,7 +3,7 @@
 CC     = ppc-amigaos-gcc
 STRIP  = ppc-amigaos-strip
 
-CFLAGS = -mcrt=newlib -mhard-float -O2 -mcpu=440 -Wall -Wextra \
+CFLAGS = -mcrt=newlib -mhard-float -O2 -Wall -Wextra \
          -D__PPC__ -D__USE_OLD_TIMEVAL__ \
          -I./include
 
