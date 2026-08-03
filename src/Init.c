@@ -154,6 +154,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         devBase->mac[4] = (UBYTE)(rah        & 0xff);
         devBase->mac[5] = (UBYTE)((rah >> 8) & 0xff);
 
+        if (devBase->mac[0] == 0 && devBase->mac[1] == 0 && devBase->mac[2] == 0) {
+            devBase->mac[0] = 0x52; devBase->mac[1] = 0x54; devBase->mac[2] = 0x00;
+            devBase->mac[3] = 0x12; devBase->mac[4] = 0x34; devBase->mac[5] = 0x56;
+        }
+
         devBase->hw_present = TRUE;
     }
 

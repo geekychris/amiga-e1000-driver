@@ -311,28 +311,27 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
     case S2_CONFIGINTERFACE: {
         IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: state=%lu\n", devBase->state);
         devBase->config_call_count++;
-        {
-            volatile UBYTE *src = (volatile UBYTE *)ioreq;
-            volatile UBYTE *dst = devBase->config_before;
-            for (int i = 0; i < 80; i++) dst[i] = src[i];
+
+        BOOL non_zero_mac = FALSE;
+        for (int i = 0; i < 6; i++) {
+            if (ioreq->ios2_SrcAddr[i] != 0) { non_zero_mac = TRUE; break; }
+        }
+        if (non_zero_mac) {
+            for (int i = 0; i < 6; i++) devBase->mac[i] = ioreq->ios2_SrcAddr[i];
         }
 
-        BOOL want_factory = TRUE;
-        for (int i = 0; i < 6; i++)
-            if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
-
-        if (!want_factory) {
-            BOOL same_mac = TRUE;
-            for (int i = 0; i < 6; i++)
-                if (ioreq->ios2_SrcAddr[i] != devBase->mac[i]) {
-                    same_mac = FALSE; break;
-                }
-            if (!same_mac) {
-                IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: MAC mismatch\n");
-                ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
-                ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
-                break;
-            }
+        /* Write MAC to hardware RAL/RAH registers */
+        if (devBase->bar0) {
+            volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+            uint32 ral = (uint32)devBase->mac[0]
+                       | ((uint32)devBase->mac[1] << 8)
+                       | ((uint32)devBase->mac[2] << 16)
+                       | ((uint32)devBase->mac[3] << 24);
+            uint32 rah = (uint32)devBase->mac[4]
+                       | ((uint32)devBase->mac[5] << 8)
+                       | (1U << 31); /* AV (Address Valid) bit */
+            e1000_write32(mmio, E1000_REG_RAL, ral);
+            e1000_write32(mmio, E1000_REG_RAH, rah);
         }
 
         for (int i = 0; i < 6; i++) {
@@ -340,30 +339,20 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
             ioreq->ios2_DstAddr[i] = 0xFF;
         }
 
-        /* Per pa6t_eth: bring hardware online and transition to ONLINE */
-        if (devBase->state != V1000_STATE_ONLINE) {
-            v1000_online_hw(devBase);
-            devBase->state = V1000_STATE_ONLINE;
-            v1000_signal_event(devBase, S2EVENT_ONLINE);
-            IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: transitioned to ONLINE\n");
-        }
-
-        {
-            volatile UBYTE *src = (volatile UBYTE *)ioreq;
-            volatile UBYTE *dst = devBase->config_after;
-            for (int i = 0; i < 80; i++) dst[i] = src[i];
-        }
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
+        IExec->DebugPrintF("[virte1000] S2_CONFIGINTERFACE: MAC=%02x:%02x:%02x:%02x:%02x:%02x -> ONLINE\n",
+                           devBase->mac[0], devBase->mac[1], devBase->mac[2],
+                           devBase->mac[3], devBase->mac[4], devBase->mac[5]);
         break;
     }
 
     case S2_ONLINE: {
         IExec->DebugPrintF("[virte1000] S2_ONLINE: state=%lu\n", devBase->state);
-        if (devBase->state != V1000_STATE_ONLINE) {
-            v1000_online_hw(devBase);
-            devBase->state = V1000_STATE_ONLINE;
-            v1000_signal_event(devBase, S2EVENT_ONLINE);
-            IExec->DebugPrintF("[virte1000] S2_ONLINE: transitioned to ONLINE\n");
-        }
+        v1000_online_hw(devBase);
+        devBase->state = V1000_STATE_ONLINE;
+        v1000_signal_event(devBase, S2EVENT_ONLINE);
         break;
     }
 
