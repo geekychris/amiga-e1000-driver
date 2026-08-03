@@ -53,6 +53,10 @@ void v1000_process_rx(struct Virte1000Base *base)
     struct ExecIFace *IExec = base->IExec;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
+    uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
+    uint32 rdt = e1000_read32(mmio, E1000_REG_RDT);
+    uint32 rctl = e1000_read32(mmio, E1000_REG_RCTL);
+
     ULONG dd_seen_this_call = 0;
     for (int slot = 0; slot < V1000_RING_ENTRIES; slot++) {
         volatile UBYTE *rd = (volatile UBYTE *)base->rx_ring + slot * V1000_DESC_SIZE;
@@ -100,8 +104,12 @@ void v1000_process_rx(struct Virte1000Base *base)
             IExec->ReplyMsg((struct Message *)ioreq);
             delivered_this_slot = ok;
 
-            IExec->DebugPrintF("[virte1000] RX: slot=%d frame_len=%lu payload=%lu ptype=0x%04lx delivered=%d\n",
-                               slot, frame_len, payload_len, (unsigned long)ioreq->ios2_PacketType, (int)ok);
+            IExec->DebugPrintF("[virte1000] RX: slot=%d frame_len=%lu payload=%lu ptype=0x%04lx\n"
+                               "            HDR: dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x delivered=%d\n",
+                               slot, frame_len, payload_len, (unsigned long)ioreq->ios2_PacketType,
+                               rxbuf[0], rxbuf[1], rxbuf[2], rxbuf[3], rxbuf[4], rxbuf[5],
+                               rxbuf[6], rxbuf[7], rxbuf[8], rxbuf[9], rxbuf[10], rxbuf[11],
+                               (int)ok);
         } else if (ioreq) {
             IExec->DebugPrintF("[virte1000] RX: slot=%d skipped (op=%p hook=%p copy_to=%p data=%p)\n",
                                slot, op, op ? op->sana2_hook : NULL,
@@ -112,6 +120,10 @@ void v1000_process_rx(struct Virte1000Base *base)
         rd[12] = 0;
         IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
         e1000_write32(mmio, E1000_REG_RDT, slot);
+    }
+    if (dd_seen_this_call > 0) {
+        IExec->DebugPrintF("[virte1000] RX: SUMMARY dd_seen=%lu rdh=%lu rdt=%lu rctl=0x%08lx\n",
+                           (unsigned long)dd_seen_this_call, (unsigned long)rdh, (unsigned long)rdt, (unsigned long)rctl);
     }
     base->process_rx_dd_seen = dd_seen_this_call;
 }

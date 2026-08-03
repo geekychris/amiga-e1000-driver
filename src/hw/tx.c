@@ -113,16 +113,19 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
                                   | E1000_TXD_CMD_RS) << 24));
     poke_le32(d + 12, 0);
 
-    v1000_wmb();
-
     volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+    uint32 tdt_before = e1000_read32(mmio, E1000_REG_TDT);
+    uint32 tdh_before = e1000_read32(mmio, E1000_REG_TDH);
+    uint32 tctl_before = e1000_read32(mmio, E1000_REG_TCTL);
+
     ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
     e1000_write32(mmio, E1000_REG_TDT, new_tdt);
     devBase->tx_next_slot = new_tdt;
 
     ULONG expected_tdh = (slot + 1) % V1000_RING_ENTRIES;
     BOOL done = FALSE;
-    for (int i = 0; i < 50000; i++) {
+    int iters = 0;
+    for (iters = 0; iters < 50000; iters++) {
         IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, CACRF_InvalidateD);
         uint32 tdh_check = e1000_read32(mmio, E1000_REG_TDH);
         if ((d[12] & E1000_TXD_STAT_DD) || (tdh_check == expected_tdh)) {
@@ -137,10 +140,16 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
     UBYTE  stat_byte = d[12];
 
-    IExec->DebugPrintF("[virte1000] TX: slot=%lu len=%lu cooked=%d phys=0x%08lx TDH=%lu TDT=%lu stat=0x%02x done=%d\n",
-                       slot, len, (int)cooked, (unsigned long)buf_phys,
+    IExec->DebugPrintF("[virte1000] TX: slot=%lu len=%lu cooked=%d phys=0x%08lx TCTL=0x%08lx\n"
+                       "            HDR: dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ptype=0x%02x%02x\n"
+                       "            REG: TDH_b=%lu TDT_b=%lu -> TDH_a=%lu TDT_a=%lu (expected=%lu) stat=0x%02x iters=%d done=%d\n",
+                       slot, len, (int)cooked, (unsigned long)buf_phys, (unsigned long)tctl_now,
+                       dst[0], dst[1], dst[2], dst[3], dst[4], dst[5],
+                       dst[6], dst[7], dst[8], dst[9], dst[10], dst[11],
+                       dst[12], dst[13],
+                       (unsigned long)tdh_before, (unsigned long)tdt_before,
                        (unsigned long)tdh_now, (unsigned long)tdt_now,
-                       (unsigned int)stat_byte, (int)done);
+                       (unsigned long)expected_tdh, (unsigned int)stat_byte, iters, (int)done);
 
     ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
     ioreq->ios2_PacketType = tctl_now;
