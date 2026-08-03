@@ -40,8 +40,11 @@
 
 /* RCTL bits */
 #define E1000_RCTL_EN             (1U << 1)   /* Receiver Enable */
+#define E1000_RCTL_UPE            (1U << 3)   /* Unicast Promiscuous Enabled */
+#define E1000_RCTL_MPE            (1U << 4)   /* Multicast Promiscuous Enabled */
 #define E1000_RCTL_BAM            (1U << 15)  /* Broadcast Accept Mode */
 #define E1000_RCTL_BSIZE_2048     (0U << 16)  /* Buffer Size 2048 bytes */
+#define E1000_RCTL_SECRC          (1U << 26)  /* Strip Ethernet CRC */
 
 /* TCTL bits */
 #define E1000_TCTL_EN             (1U << 1)   /* Transmit Enable */
@@ -81,19 +84,33 @@ static inline void v1000_wmb(void)
     __asm__ volatile ("sync" : : : "memory");
 }
 
-static inline uint32 e1000_read32(volatile void *base, uint32 off)
+#include <interfaces/expansion.h>
+
+static inline uint32 e1000_read32(struct PCIDevice *pciDev, volatile void *base, uint32 off)
 {
-    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
-    uint32 v = __builtin_bswap32(*p);
-    __asm__ volatile ("eieio" : : : "memory");
-    return v;
+    if (pciDev) {
+        return pciDev->InLong(off);
+    }
+    if (base) {
+        volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+        uint32 v = __builtin_bswap32(*p);
+        __asm__ volatile ("eieio" : : : "memory");
+        return v;
+    }
+    return 0;
 }
 
-static inline void e1000_write32(volatile void *base, uint32 off, uint32 val)
+static inline void e1000_write32(struct PCIDevice *pciDev, volatile void *base, uint32 off, uint32 val)
 {
-    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
-    *p = __builtin_bswap32(val);
-    __asm__ volatile ("eieio" : : : "memory");
+    if (pciDev) {
+        pciDev->OutLong(off, val);
+        return;
+    }
+    if (base) {
+        volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+        *p = __builtin_bswap32(val);
+        __asm__ volatile ("eieio" : : : "memory");
+    }
 }
 
 #endif /* E1000_REGS_H */

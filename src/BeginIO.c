@@ -179,8 +179,8 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
         ioreq->ios2_PacketType = devBase->state;
         if (devBase->state == V1000_STATE_ONLINE && devBase->bar0) {
             volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-            uint32 tpt = e1000_read32(mmio, E1000_REG_TPT);
-            uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
+            uint32 tpt = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TPT);
+            uint32 rdh = e1000_read32(devBase->pciDevice, mmio, E1000_REG_RDH);
             ioreq->ios2_SrcAddr[0] = (UBYTE)(tpt >> 24);
             ioreq->ios2_SrcAddr[1] = (UBYTE)(tpt >> 16);
             ioreq->ios2_SrcAddr[2] = (UBYTE)(tpt >> 8);
@@ -303,7 +303,7 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
             break;
         }
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_ICS, E1000_ICR_LSC);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_ICS, E1000_ICR_LSC);
         ioreq->ios2_DataLength = devBase->irq_counter;
         break;
     }
@@ -330,8 +330,8 @@ void v1000_dispatch_ioreq(struct Virte1000Base *devBase, struct IOSana2Req *iore
             uint32 rah = (uint32)devBase->mac[4]
                        | ((uint32)devBase->mac[5] << 8)
                        | (1U << 31); /* AV (Address Valid) bit */
-            e1000_write32(mmio, E1000_REG_RAL, ral);
-            e1000_write32(mmio, E1000_REG_RAH, rah);
+            e1000_write32(devBase->pciDevice, mmio, E1000_REG_RAL, ral);
+            e1000_write32(devBase->pciDevice, mmio, E1000_REG_RAH, rah);
         }
 
         for (int i = 0; i < 6; i++) {

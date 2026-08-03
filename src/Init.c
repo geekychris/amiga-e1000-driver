@@ -145,8 +145,8 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     /* Read MAC from hardware */
     {
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 ral = e1000_read32(mmio, E1000_REG_RAL);
-        uint32 rah = e1000_read32(mmio, E1000_REG_RAH);
+        uint32 ral = e1000_read32(devBase->pciDevice, mmio, E1000_REG_RAL);
+        uint32 rah = e1000_read32(devBase->pciDevice, mmio, E1000_REG_RAH);
         devBase->mac[0] = (UBYTE)(ral        & 0xff);
         devBase->mac[1] = (UBYTE)((ral >> 8) & 0xff);
         devBase->mac[2] = (UBYTE)((ral >> 16)& 0xff);
@@ -165,8 +165,8 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     /* Quiesce device interrupts */
     {
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
-        (void)e1000_read32(mmio, E1000_REG_ICR);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+        (void)e1000_read32(devBase->pciDevice, mmio, E1000_REG_ICR);
     }
 
     /* Allocate DMA rings */
@@ -222,21 +222,21 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         v1000_wmb();
 
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_RDBAL, devBase->rx_ring_phys);
-        e1000_write32(mmio, E1000_REG_RDBAH, 0);
-        e1000_write32(mmio, E1000_REG_RDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
-        e1000_write32(mmio, E1000_REG_RDH,   0);
-        e1000_write32(mmio, E1000_REG_RDT,   V1000_RING_ENTRIES - 1);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_RDBAL, devBase->rx_ring_phys);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_RDBAH, 0);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_RDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_RDH,   0);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_RDT,   V1000_RING_ENTRIES - 1);
     }
 
     /* Program TX ring */
     if (devBase->tx_ring && devBase->tx_ring_phys) {
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_TDBAL, devBase->tx_ring_phys);
-        e1000_write32(mmio, E1000_REG_TDBAH, 0);
-        e1000_write32(mmio, E1000_REG_TDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
-        e1000_write32(mmio, E1000_REG_TDH,   0);
-        e1000_write32(mmio, E1000_REG_TDT,   0);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDBAL, devBase->tx_ring_phys);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDBAH, 0);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDLEN, V1000_RING_ENTRIES * V1000_DESC_SIZE);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDH,   0);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDT,   0);
     }
 
     /* Install IRQ handler */

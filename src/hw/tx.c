@@ -114,19 +114,19 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     poke_le32(d + 12, 0);
 
     volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-    uint32 tctl_before = e1000_read32(mmio, E1000_REG_TCTL);
+    uint32 tctl_before = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TCTL);
     if (!(tctl_before & E1000_TCTL_EN)) {
         uint32 new_tctl = E1000_TCTL_EN | E1000_TCTL_PSP
                         | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40);
-        e1000_write32(mmio, E1000_REG_TCTL, new_tctl);
+        e1000_write32(devBase->pciDevice, mmio, E1000_REG_TCTL, new_tctl);
         tctl_before = new_tctl;
     }
 
-    uint32 tdt_before = e1000_read32(mmio, E1000_REG_TDT);
-    uint32 tdh_before = e1000_read32(mmio, E1000_REG_TDH);
+    uint32 tdt_before = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TDT);
+    uint32 tdh_before = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TDH);
 
     ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
-    e1000_write32(mmio, E1000_REG_TDT, new_tdt);
+    e1000_write32(devBase->pciDevice, mmio, E1000_REG_TDT, new_tdt);
     devBase->tx_next_slot = new_tdt;
 
     ULONG expected_tdh = (slot + 1) % V1000_RING_ENTRIES;
@@ -134,7 +134,7 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     int iters = 0;
     for (iters = 0; iters < 50000; iters++) {
         IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, CACRF_InvalidateD);
-        uint32 tdh_check = e1000_read32(mmio, E1000_REG_TDH);
+        uint32 tdh_check = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TDH);
         if ((d[12] & E1000_TXD_STAT_DD) || (tdh_check == expected_tdh)) {
             done = TRUE;
             break;
@@ -142,9 +142,9 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
         __asm__ volatile ("" : : : "memory");
     }
 
-    uint32 tdh_now  = e1000_read32(mmio, E1000_REG_TDH);
-    uint32 tdt_now  = e1000_read32(mmio, E1000_REG_TDT);
-    uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
+    uint32 tdh_now  = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TDH);
+    uint32 tdt_now  = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TDT);
+    uint32 tctl_now = e1000_read32(devBase->pciDevice, mmio, E1000_REG_TCTL);
     UBYTE  stat_byte = d[12];
 
     IExec->DebugPrintF("[virte1000] TX: slot=%lu len=%lu cooked=%d phys=0x%08lx TCTL=0x%08lx\n"

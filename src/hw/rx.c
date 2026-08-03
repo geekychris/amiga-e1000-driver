@@ -53,9 +53,16 @@ void v1000_process_rx(struct Virte1000Base *base)
     struct ExecIFace *IExec = base->IExec;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
-    uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
-    uint32 rdt = e1000_read32(mmio, E1000_REG_RDT);
-    uint32 rctl = e1000_read32(mmio, E1000_REG_RCTL);
+    uint32 rctl_now = e1000_read32(base->pciDevice, mmio, E1000_REG_RCTL);
+    if (!(rctl_now & E1000_RCTL_EN)) {
+        uint32 new_rctl = E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE
+                        | E1000_RCTL_BAM | E1000_RCTL_SECRC;
+        e1000_write32(base->pciDevice, mmio, E1000_REG_RCTL, new_rctl);
+    }
+
+    uint32 rdh = e1000_read32(base->pciDevice, mmio, E1000_REG_RDH);
+    uint32 rdt = e1000_read32(base->pciDevice, mmio, E1000_REG_RDT);
+    uint32 rctl = e1000_read32(base->pciDevice, mmio, E1000_REG_RCTL);
 
     ULONG dd_seen_this_call = 0;
     for (int slot = 0; slot < V1000_RING_ENTRIES; slot++) {
@@ -70,7 +77,7 @@ void v1000_process_rx(struct Virte1000Base *base)
         if (frame_len < 14 || frame_len > V1000_RX_BUFSIZE) {
             rd[12] = 0;
             IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
-            e1000_write32(mmio, E1000_REG_RDT, slot);
+            e1000_write32(base->pciDevice, mmio, E1000_REG_RDT, slot);
             continue;
         }
         UBYTE *rxbuf = (UBYTE *)base->rx_buffers + slot * V1000_RX_BUFSIZE;
@@ -119,7 +126,7 @@ void v1000_process_rx(struct Virte1000Base *base)
 
         rd[12] = 0;
         IExec->CacheClearE((APTR)rd, V1000_DESC_SIZE, CACRF_ClearD);
-        e1000_write32(mmio, E1000_REG_RDT, slot);
+        e1000_write32(base->pciDevice, mmio, E1000_REG_RDT, slot);
     }
     if (dd_seen_this_call > 0) {
         IExec->DebugPrintF("[virte1000] RX: SUMMARY dd_seen=%lu rdh=%lu rdt=%lu rctl=0x%08lx\n",
