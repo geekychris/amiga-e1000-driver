@@ -17,7 +17,7 @@ BUILD    = build
 DEV      = $(BUILD)/virte1000.device
 DEV_DBG  = $(BUILD)/virte1000.device.debug
 
-TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx testtx_cooked testrx_cooked testrxtask testroadshow testdiag testsizeof testdqbuf testcfgbuf testbsdadd testquery teststat
+TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx testtx_cooked testrx_cooked testrxtask testroadshow testdiag testsizeof testdqbuf testcfgbuf testbsdadd testquery teststat teststress
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRCS = src/device.c \
