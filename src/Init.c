@@ -142,11 +142,30 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         return (struct Library *)devBase;
     }
 
-    /* Read MAC from hardware */
+    /* Enable PCI Memory Access & Bus Master in PCI Command Register (offset 0x04) */
+    UWORD pci_cmd = devBase->pciDevice->ReadConfigWord(0x04);
+    devBase->pciDevice->WriteConfigWord(0x04, pci_cmd | 0x0006);
+
+    iexec->DebugPrintF("[virte1000] PCI BAR0: Base=0x%08lx Phys=0x%08lx Size=0x%08lx Flags=0x%08lx PCICMD=0x%04x->0x%04x\n",
+                       (unsigned long)devBase->bar0->BaseAddress,
+                       (unsigned long)devBase->bar0->Physical,
+                       (unsigned long)devBase->bar0->Size,
+                       (unsigned long)devBase->bar0->Flags,
+                       (unsigned int)pci_cmd,
+                       (unsigned int)(pci_cmd | 0x0006));
+
+    /* Read MAC and initial status from hardware */
     {
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 ral = e1000_read32(mmio, E1000_REG_RAL);
-        uint32 rah = e1000_read32(mmio, E1000_REG_RAH);
+        uint32 ctrl   = e1000_read32(mmio, 0x00000); /* E1000_CTRL */
+        uint32 status = e1000_read32(mmio, 0x00008); /* E1000_STATUS */
+        uint32 ral    = e1000_read32(mmio, E1000_REG_RAL);
+        uint32 rah    = e1000_read32(mmio, E1000_REG_RAH);
+
+        iexec->DebugPrintF("[virte1000] HW INIT: CTRL=0x%08lx STATUS=0x%08lx RAL=0x%08lx RAH=0x%08lx\n",
+                           (unsigned long)ctrl, (unsigned long)status,
+                           (unsigned long)ral, (unsigned long)rah);
+
         devBase->mac[0] = (UBYTE)(ral        & 0xff);
         devBase->mac[1] = (UBYTE)((ral >> 8) & 0xff);
         devBase->mac[2] = (UBYTE)((ral >> 16)& 0xff);
