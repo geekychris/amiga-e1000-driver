@@ -9,42 +9,29 @@
 typedef BOOL (*V1000CopyFn)(APTR to, APTR from, ULONG size);
 
 BOOL v1000_invoke_copy_to(struct Virte1000Base *base,
-                         struct V1000Opener *op,
-                         struct IOSana2Req *ioreq,
-                         APTR from, ULONG size)
+                          struct V1000Opener *op,
+                          struct IOSana2Req *ioreq,
+                          APTR from, ULONG size)
 {
-    if (!op) return FALSE;
+    if (!op || !base->IUtility) return FALSE;
     base->copy_to_calls++;
     base->last_copy_to_size = size;
 
-    if (op->sana2_hook) {
-        base->last_copy_to_ptr = op->sana2_hook;
-        base->last_copy_to_tag = S2_CopyToBuff;
-        struct SANA2CopyHookMsg msg;
-        msg.schm_Method  = S2_CopyToBuff;
-        msg.schm_MsgSize = sizeof(msg);
-        msg.schm_To      = ioreq->ios2_Data;
-        msg.schm_From    = from;
-        msg.schm_Size    = size;
-        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
-            op->sana2_hook, ioreq, &msg);
-    }
+    struct Hook *hook = op->sana2_hook ? op->sana2_hook : (struct Hook *)op->copy_to_buff;
+    if (!hook) return FALSE;
 
-    if (!op->copy_to_buff) return FALSE;
-    base->last_copy_to_ptr = op->copy_to_buff;
-    base->last_copy_to_tag = op->copy_to_tag;
-    if (op->copy_to_tag == S2_CopyToBuff) {
-        V1000CopyFn fn = (V1000CopyFn)op->copy_to_buff;
-        return fn(ioreq->ios2_Data, from, size);
-    }
+    ULONG tag = op->sana2_hook ? S2_CopyToBuff : op->copy_to_tag;
+    base->last_copy_to_ptr = hook;
+    base->last_copy_to_tag = tag;
+
     struct SANA2CopyHookMsg msg;
-    msg.schm_Method  = op->copy_to_tag;
+    msg.schm_Method  = tag;
     msg.schm_MsgSize = sizeof(msg);
     msg.schm_To      = ioreq->ios2_Data;
     msg.schm_From    = from;
     msg.schm_Size    = size;
-    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
-        (struct Hook *)op->copy_to_buff, ioreq, &msg);
+
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(hook, ioreq, &msg);
 }
 
 void v1000_process_rx(struct Virte1000Base *base)

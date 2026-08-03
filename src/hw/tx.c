@@ -9,41 +9,29 @@
 typedef BOOL (*V1000CopyFn)(APTR to, APTR from, ULONG size);
 
 BOOL v1000_invoke_copy_from(struct Virte1000Base *base,
-                           struct V1000Opener *op,
-                           struct IOSana2Req *ioreq,
-                           APTR to, ULONG size)
+                            struct V1000Opener *op,
+                            struct IOSana2Req *ioreq,
+                            APTR to, ULONG size)
 {
-    if (!op) return FALSE;
+    if (!op || !base->IUtility) return FALSE;
     base->copy_from_calls++;
     base->last_copy_from_size = size;
 
-    if (op->sana2_hook) {
-        base->last_copy_from_ptr = op->sana2_hook;
-        base->last_copy_from_tag = S2_CopyFromBuff;
-        struct SANA2CopyHookMsg msg;
-        msg.schm_Method  = S2_CopyFromBuff;
-        msg.schm_MsgSize = sizeof(msg);
-        msg.schm_To      = to;
-        msg.schm_From    = ioreq->ios2_Data;
-        msg.schm_Size    = size;
-        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
-            op->sana2_hook, ioreq, &msg);
-    }
-    if (!op->copy_from_buff) return FALSE;
-    base->last_copy_from_ptr = op->copy_from_buff;
-    base->last_copy_from_tag = op->copy_from_tag;
-    if (op->copy_from_tag == S2_CopyFromBuff) {
-        V1000CopyFn fn = (V1000CopyFn)op->copy_from_buff;
-        return fn(to, ioreq->ios2_Data, size);
-    }
+    struct Hook *hook = op->sana2_hook ? op->sana2_hook : (struct Hook *)op->copy_from_buff;
+    if (!hook) return FALSE;
+
+    ULONG tag = op->sana2_hook ? S2_CopyFromBuff : op->copy_from_tag;
+    base->last_copy_from_ptr = hook;
+    base->last_copy_from_tag = tag;
+
     struct SANA2CopyHookMsg msg;
-    msg.schm_Method  = op->copy_from_tag;
+    msg.schm_Method  = tag;
     msg.schm_MsgSize = sizeof(msg);
     msg.schm_To      = to;
     msg.schm_From    = ioreq->ios2_Data;
     msg.schm_Size    = size;
-    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
-        (struct Hook *)op->copy_from_buff, ioreq, &msg);
+
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(hook, ioreq, &msg);
 }
 
 BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op, struct IOSana2Req *ioreq)
