@@ -39,20 +39,20 @@ void v1000_online_hw(struct Virte1000Base *base)
 {
     if (!base->bar0) return;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
-    e1000_write32(base->pciDevice, mmio, E1000_REG_RCTL,
+    e1000_write32(mmio, E1000_REG_RCTL,
                   E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE
                   | E1000_RCTL_BAM | E1000_RCTL_SECRC);
-    e1000_write32(base->pciDevice, mmio, E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP
+    e1000_write32(mmio, E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP
                                        | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40));
-    e1000_write32(base->pciDevice, mmio, E1000_REG_IMS, E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
+    e1000_write32(mmio, E1000_REG_IMS, E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
 }
 
 void v1000_offline_hw(struct Virte1000Base *base)
 {
     if (!base->bar0) return;
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
-    e1000_write32(base->pciDevice, mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
-    (void)e1000_read32(base->pciDevice, mmio, E1000_REG_ICR);
-    e1000_write32(base->pciDevice, mmio, E1000_REG_RCTL, 0);
-    e1000_write32(base->pciDevice, mmio, E1000_REG_TCTL, 0);
+    e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+    (void)e1000_read32(mmio, E1000_REG_ICR);
+    e1000_write32(mmio, E1000_REG_RCTL, 0);
+    e1000_write32(mmio, E1000_REG_TCTL, 0);
 }

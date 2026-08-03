@@ -86,31 +86,21 @@ static inline void v1000_wmb(void)
 
 #include <interfaces/expansion.h>
 
-static inline uint32 e1000_read32(struct PCIDevice *pciDev, volatile void *base, uint32 off)
+static inline uint32 e1000_read32(volatile void *base, uint32 off)
 {
-    if (pciDev) {
-        return pciDev->InLong(off);
-    }
-    if (base) {
-        volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
-        uint32 v = __builtin_bswap32(*p);
-        __asm__ volatile ("eieio" : : : "memory");
-        return v;
-    }
-    return 0;
+    if (!base) return 0;
+    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+    uint32 v = __builtin_bswap32(*p);
+    __asm__ volatile ("eieio" : : : "memory");
+    return v;
 }
 
-static inline void e1000_write32(struct PCIDevice *pciDev, volatile void *base, uint32 off, uint32 val)
+static inline void e1000_write32(volatile void *base, uint32 off, uint32 val)
 {
-    if (pciDev) {
-        pciDev->OutLong(off, val);
-        return;
-    }
-    if (base) {
-        volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
-        *p = __builtin_bswap32(val);
-        __asm__ volatile ("eieio" : : : "memory");
-    }
+    if (!base) return;
+    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+    *p = __builtin_bswap32(val);
+    __asm__ volatile ("eieio" : : : "memory");
 }
 
 #endif /* E1000_REGS_H */

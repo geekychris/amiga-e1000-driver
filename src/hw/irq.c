@@ -14,7 +14,7 @@ uint32 v1000_isr(struct ExceptionContext *ctx, struct ExecBase *sysbase, APTR is
     if (!base || !base->bar0) return 0;
 
     volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
-    uint32 icr = e1000_read32(base->pciDevice, mmio, E1000_REG_ICR);
+    uint32 icr = e1000_read32(mmio, E1000_REG_ICR);
     if (icr == 0)
         return 0;               /* not ours (or nothing pending) */
 

@@ -18,8 +18,8 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
 
         if (devBase->bar0) {
             volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-            e1000_write32(devBase->pciDevice, mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
-            (void)e1000_read32(devBase->pciDevice, mmio, E1000_REG_ICR);
+            e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+            (void)e1000_read32(mmio, E1000_REG_ICR);
         }
         if (devBase->irq_installed) {
             IExec->RemIntServer(devBase->irq_vector, &devBase->irq_node);
