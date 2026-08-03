@@ -523,7 +523,9 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     ioreq->ios2_WireError    = 0;
 
     UWORD cmd = ioreq->ios2_Req.io_Command;
+#ifdef DEBUG
     IExec->DebugPrintF("[virte1000] BeginIO: cmd=%u ioreq=%p\n", (unsigned int)cmd, ioreq);
+#endif
     if (cmd == V1000_DBG_STATUS || cmd == V1000_DBG_CMDLOG ||
         cmd == V1000_DBG_DQBUF   || cmd == V1000_DBG_CFGBUF ||
         cmd == V1000_DBG_DUMPTX) {

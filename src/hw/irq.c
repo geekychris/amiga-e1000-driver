@@ -22,6 +22,7 @@ uint32 v1000_isr(struct ExceptionContext *ctx, struct ExecBase *sysbase, APTR is
     base->last_icr = icr;
 
     struct ExecIFace *IExec = base->IExec;
+#ifdef DEBUG
     if (IExec) {
         IExec->DebugPrintF("[virte1000] ISR: #%lu icr=0x%08lx (RX=%d TX=%d LSC=%d)\n",
                            (unsigned long)base->irq_counter, (unsigned long)icr,
@@ -29,6 +30,7 @@ uint32 v1000_isr(struct ExceptionContext *ctx, struct ExecBase *sysbase, APTR is
                            (int)((icr & 1U) != 0),
                            (int)((icr & (1U << 2)) != 0));
     }
+#endif
 
     if (base->unit_task && base->unit_signal_mask && IExec) {
         IExec->Signal(base->unit_task, base->unit_signal_mask);

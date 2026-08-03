@@ -47,8 +47,10 @@ void v1000_task_body(void)
         if (got & base->begin_port_mask) {
             struct IOSana2Req *req;
             while ((req = (struct IOSana2Req *)IExec->GetMsg(base->begin_port)) != NULL) {
+#ifdef DEBUG
                 IExec->DebugPrintF("[virte1000] UnitTask: dispatching req=%p cmd=%u\n",
                                    req, req->ios2_Req.io_Command);
+#endif
                 v1000_dispatch_ioreq(base, req);
             }
         }

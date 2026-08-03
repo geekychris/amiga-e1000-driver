@@ -127,8 +127,10 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
         tctl_before = new_tctl;
     }
 
+#ifdef DEBUG
     uint32 tdt_before = e1000_read32(mmio, E1000_REG_TDT);
     uint32 tdh_before = e1000_read32(mmio, E1000_REG_TDH);
+#endif
 
     ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
     e1000_write32(mmio, E1000_REG_TDT, new_tdt);
@@ -152,6 +154,7 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
     UBYTE  stat_byte = d[12];
 
+#ifdef DEBUG
     IExec->DebugPrintF("[virte1000] TX: slot=%lu len=%lu cooked=%d phys=0x%08lx TCTL=0x%08lx\n"
                        "            HDR: dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ptype=0x%02x%02x\n"
                        "            REG: TDH_b=%lu TDT_b=%lu -> TDH_a=%lu TDT_a=%lu (expected=%lu) stat=0x%02x iters=%d done=%d\n",
@@ -174,6 +177,7 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
                        dst[22], dst[23], dst[24], dst[25], dst[26], dst[27], dst[28], dst[29],
                        dst[30], dst[31], dst[32], dst[33], dst[34], dst[35], dst[36], dst[37],
                        dst[38], dst[39], dst[40], dst[41]);
+#endif
 
     ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
     ioreq->ios2_PacketType = tctl_now;
