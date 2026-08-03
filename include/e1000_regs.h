@@ -64,43 +64,34 @@
 /* Legacy TX descriptor STATUS bits (byte 12). */
 #define E1000_TXD_STAT_DD         (1U << 0)   /* Descriptor Done */
 
-/* Little-endian store to main memory. Descriptor entries live in host RAM
- * but the e1000 reads them as LE, so we byte-reverse on the store side. */
 static inline void poke_le32(volatile void *p, uint32 v)
 {
-    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "b"(p) : "memory");
+    *(volatile uint32 *)p = __builtin_bswap32(v);
 }
 
 static inline uint32 peek_le32(volatile void *p)
 {
-    uint32 v;
-    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(v) : "b"(p) : "memory");
-    return v;
+    return __builtin_bswap32(*(volatile uint32 *)p);
 }
 
-/* Full memory barrier — ensures all prior stores complete before any
- * subsequent memory ops. Required after building a descriptor and
- * before writing the doorbell (TDT) so HW sees a consistent descriptor. */
 static inline void v1000_wmb(void)
 {
     __asm__ volatile ("sync" : : : "memory");
 }
 
-/* PPC MMIO helpers. e1000 registers are little-endian; PPC 460EX is
- * big-endian; we use the byte-reversed load/store insns (lwbrx/stwbrx)
- * so we can dereference LE registers without an explicit bswap step. */
 static inline uint32 e1000_read32(volatile void *base, uint32 off)
 {
-    volatile uint8 *p = (volatile uint8 *)base + off;
-    uint32 v;
-    __asm__ volatile ("lwbrx %0, 0, %1; eieio" : "=r"(v) : "b"(p) : "memory");
+    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+    uint32 v = __builtin_bswap32(*p);
+    __asm__ volatile ("eieio" : : : "memory");
     return v;
 }
 
 static inline void e1000_write32(volatile void *base, uint32 off, uint32 val)
 {
-    volatile uint8 *p = (volatile uint8 *)base + off;
-    __asm__ volatile ("stwbrx %0, 0, %1; eieio" : : "r"(val), "b"(p) : "memory");
+    volatile uint32 *p = (volatile uint32 *)((volatile uint8 *)base + off);
+    *p = __builtin_bswap32(val);
+    __asm__ volatile ("eieio" : : : "memory");
 }
 
 #endif /* E1000_REGS_H */
