@@ -114,9 +114,16 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
     poke_le32(d + 12, 0);
 
     volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+    uint32 tctl_before = e1000_read32(mmio, E1000_REG_TCTL);
+    if (!(tctl_before & E1000_TCTL_EN)) {
+        uint32 new_tctl = E1000_TCTL_EN | E1000_TCTL_PSP
+                        | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40);
+        e1000_write32(mmio, E1000_REG_TCTL, new_tctl);
+        tctl_before = new_tctl;
+    }
+
     uint32 tdt_before = e1000_read32(mmio, E1000_REG_TDT);
     uint32 tdh_before = e1000_read32(mmio, E1000_REG_TDH);
-    uint32 tctl_before = e1000_read32(mmio, E1000_REG_TCTL);
 
     ULONG new_tdt = (slot + 1) % V1000_RING_ENTRIES;
     e1000_write32(mmio, E1000_REG_TDT, new_tdt);

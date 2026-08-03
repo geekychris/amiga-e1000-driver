@@ -46,6 +46,8 @@
 /* TCTL bits */
 #define E1000_TCTL_EN             (1U << 1)   /* Transmit Enable */
 #define E1000_TCTL_PSP            (1U << 3)   /* Pad Short Packets */
+#define E1000_TCTL_CT(v)          (((v) & 0xff)  << 4)
+#define E1000_TCTL_COLD(v)        (((v) & 0x3ff) << 12)
 
 /* Interrupt Cause bits */
 #define E1000_ICR_TXDW            (1U << 0)   /* Transmit Descriptor Written Back */
