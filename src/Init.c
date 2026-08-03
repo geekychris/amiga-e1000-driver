@@ -239,6 +239,7 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
             poke_le32(d + 8, 0);
             poke_le32(d + 12, 0);
         }
+        iexec->CacheClearE((APTR)devBase->rx_ring, V1000_RING_ENTRIES * V1000_DESC_SIZE, CACRF_ClearD);
         v1000_wmb();
 
         volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;

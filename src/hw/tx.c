@@ -113,6 +113,11 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
                                   | E1000_TXD_CMD_RS) << 24));
     poke_le32(d + 12, 0);
 
+    IExec->CacheClearE((APTR)d, V1000_DESC_SIZE, CACRF_ClearD);
+    if (cooked) {
+        IExec->CacheClearE((APTR)devBase->tx_scratch, len, CACRF_ClearD);
+    }
+
     volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
     uint32 tctl_before = e1000_read32(mmio, E1000_REG_TCTL);
     if (!(tctl_before & E1000_TCTL_EN)) {
