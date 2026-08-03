@@ -75,24 +75,34 @@ void v1000_process_rx(struct Virte1000Base *base)
         ULONG payload_len = frame_len - 14;
         BOOL delivered_this_slot = FALSE;
 
+        ULONG pkt_type = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+
         struct IOSana2Req *ioreq = NULL;
         struct V1000Opener *op   = NULL;
         IExec->ObtainSemaphore(&base->opener_lock);
         for (struct V1000Opener *o = (struct V1000Opener *)base->opener_list.mlh_Head;
              o->node.mln_Succ;
              o = (struct V1000Opener *)o->node.mln_Succ) {
-            if (o->read_queue.mlh_Head && o->read_queue.mlh_Head->mln_Succ) {
-                op = o;
-                ioreq = (struct IOSana2Req *)IExec->RemHead((struct List *)&o->read_queue);
-                break;
+            for (struct Node *n = (struct Node *)o->read_queue.mlh_Head;
+                 n->ln_Succ;
+                 n = n->ln_Succ) {
+                struct IOSana2Req *r = (struct IOSana2Req *)n;
+                if (r->ios2_PacketType == pkt_type || r->ios2_PacketType == 0 ||
+                    (r->ios2_Req.io_Flags & SANA2IOF_RAW)) {
+                    op = o;
+                    ioreq = r;
+                    IExec->Remove((struct Node *)r);
+                    break;
+                }
             }
+            if (ioreq) break;
         }
         IExec->ReleaseSemaphore(&base->opener_lock);
 
         if (ioreq && op && (op->copy_to_buff || op->sana2_hook) && ioreq->ios2_Data) {
             for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
             for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = rxbuf[i];
-            ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+            ioreq->ios2_PacketType = pkt_type;
 
             BOOL is_raw = (ioreq->ios2_Req.io_Flags & SANA2IOF_RAW) != 0;
             APTR copy_ptr = is_raw ? (APTR)rxbuf : (APTR)(rxbuf + 14);
