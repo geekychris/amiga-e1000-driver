@@ -80,6 +80,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < 64; i++) payload[i] = (UBYTE)(i & 0xFF);
 
 #include <time.h>
+#include <stdint.h>
 
     clock_t start_clk = clock();
 
@@ -102,14 +103,16 @@ int main(int argc, char **argv)
     }
 
     clock_t end_clk = clock();
-    double total_secs = (double)(end_clk - start_clk) / (double)CLOCKS_PER_SEC;
-    double pps = total_secs > 0.0 ? (double)success_cnt / total_secs : 0.0;
-    double kbps = total_secs > 0.0 ? (double)(success_cnt * (64 + 14)) / (total_secs * 1024.0) : 0.0;
+    ULONG total_ms = (ULONG)(((uint64_t)(end_clk - start_clk) * 1000ULL) / (uint64_t)CLOCKS_PER_SEC);
+    if (total_ms == 0) total_ms = 1;
+
+    ULONG pps = (ULONG)(((uint64_t)success_cnt * 1000ULL) / (uint64_t)total_ms);
+    ULONG kbps = (ULONG)(((uint64_t)success_cnt * 78ULL * 1000ULL) / ((uint64_t)total_ms * 1024ULL));
 
     IDOS->Printf("=== STRESS TEST RESULTS ===\n");
     IDOS->Printf("Sent: %ld | Success: %ld | Fail: %ld\n", num_packets, success_cnt, fail_cnt);
-    IDOS->Printf("Elapsed Time: %.3f seconds\n", total_secs);
-    IDOS->Printf("Throughput: %.2f packets/sec (%.2f KB/sec)\n", pps, kbps);
+    IDOS->Printf("Elapsed Time: %lu.%03lu seconds\n", total_ms / 1000UL, total_ms % 1000UL);
+    IDOS->Printf("Throughput: %lu packets/sec (%lu KB/sec)\n", pps, kbps);
 
     /* Get Global Stats */
     struct Sana2DeviceStats stats;
