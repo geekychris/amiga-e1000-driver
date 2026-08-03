@@ -68,13 +68,13 @@
  * but the e1000 reads them as LE, so we byte-reverse on the store side. */
 static inline void poke_le32(volatile void *p, uint32 v)
 {
-    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "r"(p) : "memory");
+    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "b"(p) : "memory");
 }
 
 static inline uint32 peek_le32(volatile void *p)
 {
     uint32 v;
-    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(v) : "r"(p) : "memory");
+    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(v) : "b"(p) : "memory");
     return v;
 }
 
@@ -93,14 +93,14 @@ static inline uint32 e1000_read32(volatile void *base, uint32 off)
 {
     volatile uint8 *p = (volatile uint8 *)base + off;
     uint32 v;
-    __asm__ volatile ("lwbrx %0, 0, %1; eieio" : "=r"(v) : "r"(p) : "memory");
+    __asm__ volatile ("lwbrx %0, 0, %1; eieio" : "=r"(v) : "b"(p) : "memory");
     return v;
 }
 
 static inline void e1000_write32(volatile void *base, uint32 off, uint32 val)
 {
     volatile uint8 *p = (volatile uint8 *)base + off;
-    __asm__ volatile ("stwbrx %0, 0, %1; eieio" : : "r"(val), "r"(p) : "memory");
+    __asm__ volatile ("stwbrx %0, 0, %1; eieio" : : "r"(val), "b"(p) : "memory");
 }
 
 #endif /* E1000_REGS_H */
