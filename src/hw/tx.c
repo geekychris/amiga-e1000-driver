@@ -163,6 +163,18 @@ BOOL v1000_transmit_packet(struct Virte1000Base *devBase, struct V1000Opener *op
                        (unsigned long)tdh_now, (unsigned long)tdt_now,
                        (unsigned long)expected_tdh, (unsigned int)stat_byte, iters, (int)done);
 
+    IExec->DebugPrintF("[virte1000] TX DATA (first 42 bytes):\n"
+                       "            %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x\n"
+                       "            %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n"
+                       "            %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                       dst[0], dst[1], dst[2], dst[3], dst[4], dst[5],
+                       dst[6], dst[7], dst[8], dst[9], dst[10], dst[11],
+                       dst[12], dst[13],
+                       dst[14], dst[15], dst[16], dst[17], dst[18], dst[19], dst[20], dst[21],
+                       dst[22], dst[23], dst[24], dst[25], dst[26], dst[27], dst[28], dst[29],
+                       dst[30], dst[31], dst[32], dst[33], dst[34], dst[35], dst[36], dst[37],
+                       dst[38], dst[39], dst[40], dst[41]);
+
     ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
     ioreq->ios2_PacketType = tctl_now;
     ioreq->ios2_WireError  = ((ULONG)stat_byte)
