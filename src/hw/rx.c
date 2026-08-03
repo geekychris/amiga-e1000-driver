@@ -93,9 +93,14 @@ void v1000_process_rx(struct Virte1000Base *base)
             for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
             for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = rxbuf[i];
             ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
-            ioreq->ios2_DataLength = payload_len;
 
-            BOOL ok = v1000_invoke_copy_to(base, op, ioreq, rxbuf + 14, payload_len);
+            BOOL is_raw = (ioreq->ios2_Req.io_Flags & SANA2IOF_RAW) != 0;
+            APTR copy_ptr = is_raw ? (APTR)rxbuf : (APTR)(rxbuf + 14);
+            ULONG copy_len = is_raw ? frame_len : payload_len;
+
+            ioreq->ios2_DataLength = copy_len;
+
+            BOOL ok = v1000_invoke_copy_to(base, op, ioreq, copy_ptr, copy_len);
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
             delivered_this_slot = ok;
