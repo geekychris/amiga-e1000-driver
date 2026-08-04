@@ -9,6 +9,7 @@
 #include <utility/hooks.h>
 #include <utility/tagitem.h>
 #include <devices/sana2.h>
+#include <dos/dos.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -85,7 +86,22 @@ int main(int argc, char **argv)
     clock_t start_clk = clock();
 
     LONG success_cnt = 0, fail_cnt = 0;
-    for (LONG i = 0; i < num_packets; i++) {
+    BOOL aborted = FALSE;
+    LONG i;
+    for (i = 0; i < num_packets; i++) {
+        /* Check for Ctrl-C every 1024 packets. Cheap enough at 40 kpps
+         * (~40 checks/sec) that it doesn't skew the throughput number,
+         * and it means picking a too-large count is recoverable without
+         * rebooting the machine. */
+        if ((i & 0x3FF) == 0) {
+            ULONG sigs = IExec->SetSignal(0L, 0L);
+            if (sigs & SIGBREAKF_CTRL_C) {
+                IExec->SetSignal(0L, SIGBREAKF_CTRL_C);
+                aborted = TRUE;
+                break;
+            }
+        }
+
         req->ios2_Req.io_Command = CMD_WRITE;
         req->ios2_Req.io_Error   = 0;
         req->ios2_WireError      = 0;
@@ -100,6 +116,10 @@ int main(int argc, char **argv)
         } else {
             fail_cnt++;
         }
+    }
+    if (aborted) {
+        IDOS->Printf("*** interrupted at packet %ld — printing partial stats ***\n", i);
+        num_packets = i;
     }
 
     clock_t end_clk = clock();
