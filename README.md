@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Amiga E1000 Driver logo" width="180">
+</p>
+
 # virte1000
 
 Intel e1000 (82540EM) SANA-II network device driver for AmigaOS 4.1 PPC,
